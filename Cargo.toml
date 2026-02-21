@@ -1,0 +1,28 @@
+[package]
+name = "cowfile"
+version = "0.1.0"
+authors = ["Johann Kempter <admin@binflip.rs>"]
+edition = "2021"
+description = "A copy-on-write overlay layer for immutable binary data"
+license = "Apache-2.0"
+repository = "https://github.com/BinFlip/cowfile"
+homepage = "https://github.com/BinFlip/cowfile"
+documentation = "https://docs.rs/cowfile"
+keywords = ["binary", "overlay", "copy-on-write", "patching", "file"]
+categories = ["data-structures", "filesystem"]
+readme = "README.md"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+thiserror = "2.0.18"
+memmap2 = "0.9.10"
+
+[dev-dependencies]
+tempfile = "3.25.0"
+
+[profile.release]
+lto = "fat"
+opt-level = 3

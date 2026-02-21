@@ -1,0 +1,174 @@
+name: Release and Publish
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/**'
+      - '!.github/workflows/release.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Pre-Release Tests
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Setup Rust cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      run: cargo clippy --all-targets -- -D warnings
+      env:
+        RUSTFLAGS: "-Dwarnings"
+
+    - name: Run tests
+      run: cargo test --release --verbose
+
+    - name: Check documentation
+      run: cargo doc --no-deps
+
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_created: ${{ steps.check_release.outputs.created }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Get version from Cargo.toml
+      id: version
+      run: |
+        VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d '"' -f 2)
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION"
+
+    - name: Check if release exists
+      id: check_release
+      run: |
+        if gh release view "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+          echo "created=false" >> $GITHUB_OUTPUT
+          echo "Release v${{ steps.version.outputs.version }} already exists, skipping"
+        else
+          echo "created=true" >> $GITHUB_OUTPUT
+        fi
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Generate changelog
+      id: changelog
+      if: steps.check_release.outputs.created == 'true'
+      run: |
+        LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+
+        if [ -z "$LATEST_TAG" ]; then
+          CHANGELOG=$(git log --pretty=format:"- %s (%h)" --no-merges)
+        else
+          CHANGELOG=$(git log ${LATEST_TAG}..HEAD --pretty=format:"- %s (%h)" --no-merges)
+        fi
+
+        if [ -z "$CHANGELOG" ]; then
+          CHANGELOG="- Initial release"
+        fi
+
+        echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+        echo "$CHANGELOG" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Create Release
+      if: steps.check_release.outputs.created == 'true'
+      run: |
+        VERSION="v${{ steps.version.outputs.version }}"
+        cat <<BODY > release_body.md
+        ## Changes in ${VERSION}
+
+        ${{ steps.changelog.outputs.CHANGELOG }}
+
+        ## Installation
+
+        Add this to your \`Cargo.toml\`:
+
+        \`\`\`toml
+        [dependencies]
+        cowfile = "${{ steps.version.outputs.version }}"
+        \`\`\`
+
+        Or install via cargo:
+
+        \`\`\`bash
+        cargo add cowfile
+        \`\`\`
+        BODY
+
+        gh release create "$VERSION" \
+          --title "Release ${VERSION}" \
+          --notes-file release_body.md
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [test, create-release]
+    if: needs.create-release.outputs.release_created == 'true'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Setup Rust cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Verify package can be published
+      run: cargo publish --dry-run
+
+    - name: Publish to crates.io
+      run: cargo publish
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  verify-docs:
+    name: Verify Documentation
+    runs-on: ubuntu-latest
+    needs: [test, create-release]
+    if: needs.create-release.outputs.release_created == 'true'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Setup Rust cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Build documentation for docs.rs
+      run: |
+        cargo doc --no-deps --document-private-items
+        echo "Documentation builds successfully"
+        echo "Documentation will be automatically available at https://docs.rs/cowfile after publishing"
