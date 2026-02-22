@@ -1,8 +1,8 @@
 //! Error types for the cowfile crate.
 //!
 //! All fallible operations in this crate return [`Result<T>`], which is an alias
-//! for `std::result::Result<T, Error>`. The [`Error`] enum covers I/O failures,
-//! out-of-bounds access, memory-mapping issues, and lock poisoning.
+//! for `std::result::Result<T, Error>`. The [`Error`] enum covers I/O failures
+//! and out-of-bounds access.
 
 use thiserror::Error;
 
@@ -17,19 +17,12 @@ pub enum Error {
     #[error("offset {offset} with length {length} exceeds file size {file_size}")]
     OutOfBounds {
         /// The starting offset of the access.
-        offset: u64,
+        offset: usize,
         /// The length of the access.
-        length: u64,
+        length: usize,
         /// The total size of the file.
-        file_size: u64,
+        file_size: usize,
     },
-
-    /// A lock was poisoned due to a panic in another thread.
-    #[error("lock poisoned: {0}")]
-    LockPoisoned(
-        /// Details about the poisoned lock.
-        String,
-    ),
 }
 
 impl From<Error> for std::io::Error {

@@ -1,10 +1,6 @@
 //! Integration tests for the cowfile crate.
 
-use std::{
-    io::{Read, Seek, SeekFrom, Write},
-    sync::Arc,
-    thread,
-};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use cowfile::{CowFile, ReadFrom, WriteTo};
 
@@ -16,7 +12,7 @@ fn test_end_to_end_vec() {
         *byte = (i % 256) as u8;
     }
 
-    let pf = CowFile::from_vec(data.clone());
+    let mut pf = CowFile::from_vec(data.clone());
 
     // Pass 1: Patch the first 4 bytes (MZ header simulation).
     pf.write(0, &[0x4D, 0x5A, 0x90, 0x00]).unwrap();
@@ -26,10 +22,10 @@ fn test_end_to_end_vec() {
     pf.write(512, &[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
     pf.commit().unwrap();
 
-    // Pass 3: Patch near the end.
+    // Pass 3: Patch near the end (still pending).
     pf.write(1020, &[0xCA, 0xFE, 0xBA, 0xBE]).unwrap();
 
-    // Verify reads.
+    // Verify reads (composites pending over committed).
     assert_eq!(pf.read(0, 4).unwrap(), vec![0x4D, 0x5A, 0x90, 0x00]);
     assert_eq!(pf.read(512, 4).unwrap(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
     assert_eq!(pf.read(1020, 4).unwrap(), vec![0xCA, 0xFE, 0xBA, 0xBE]);
@@ -38,8 +34,8 @@ fn test_end_to_end_vec() {
     assert_eq!(pf.read(4, 4).unwrap(), data[4..8]);
     assert_eq!(pf.read(100, 10).unwrap(), data[100..110]);
 
-    // Produce output.
-    let output = pf.to_vec().unwrap();
+    // Produce output (composites pending).
+    let output = pf.to_vec();
     assert_eq!(output.len(), 1024);
     assert_eq!(&output[0..4], &[0x4D, 0x5A, 0x90, 0x00]);
     assert_eq!(&output[512..516], &[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -49,8 +45,11 @@ fn test_end_to_end_vec() {
     assert_eq!(&output[4..512], &data[4..512]);
     assert_eq!(&output[516..1020], &data[516..1020]);
 
-    // Base data should be completely unchanged.
-    assert_eq!(pf.base_data(), &data[..]);
+    // data() shows committed state (pass 1 + pass 2 committed, pass 3 pending).
+    assert_eq!(&pf.data()[0..4], &[0x4D, 0x5A, 0x90, 0x00]);
+    assert_eq!(&pf.data()[512..516], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    // Pass 3 not yet committed — data() shows original bytes here.
+    assert_eq!(&pf.data()[1020..1024], &data[1020..1024]);
 }
 
 #[test]
@@ -61,7 +60,7 @@ fn test_end_to_end_mmap() {
     tmpfile.write_all(&original).unwrap();
     tmpfile.flush().unwrap();
 
-    let pf = CowFile::from_path(tmpfile.path()).unwrap();
+    let mut pf = CowFile::open(tmpfile.path()).unwrap();
     assert_eq!(pf.len(), 256);
 
     // Modify and verify.
@@ -69,13 +68,91 @@ fn test_end_to_end_mmap() {
     pf.write(255, &[0x00]).unwrap();
     pf.commit().unwrap();
 
-    let output = pf.to_vec().unwrap();
+    let output = pf.to_vec();
     assert_eq!(output[0], 0xFF);
     assert_eq!(output[1], 1); // Original
     assert_eq!(output[255], 0x00);
 
-    // Base data unchanged.
-    assert_eq!(pf.base_data(), &original[..]);
+    // data() shows committed state.
+    assert_eq!(pf.data()[0], 0xFF);
+    assert_eq!(pf.data()[255], 0x00);
+}
+
+#[test]
+fn test_mmap_cow_does_not_modify_original() {
+    // Verify that the original file on disk is never modified.
+    let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+    let original = vec![0xAA; 256];
+    tmpfile.write_all(&original).unwrap();
+    tmpfile.flush().unwrap();
+
+    let mut pf = CowFile::open(tmpfile.path()).unwrap();
+    pf.write(0, &[0xFF; 128]).unwrap();
+    pf.commit().unwrap();
+
+    // Read the original file directly from disk.
+    let on_disk = std::fs::read(tmpfile.path()).unwrap();
+    assert_eq!(on_disk, original, "original file must be unchanged on disk");
+
+    // But CowFile shows the committed modifications.
+    assert_eq!(pf.data()[0], 0xFF);
+    assert_eq!(pf.data()[128], 0xAA);
+}
+
+#[test]
+fn test_data_while_writing() {
+    let pf = CowFile::from_vec(vec![0u8; 100]);
+
+    // Hold a data() reference while writing — both are &self borrows.
+    let view = pf.data();
+    pf.write(10, &[0xFF]).unwrap();
+
+    // data() view shows committed state (unchanged).
+    assert_eq!(view[10], 0x00);
+
+    // read() composites pending.
+    assert_eq!(pf.read_byte(10).unwrap(), 0xFF);
+}
+
+#[test]
+fn test_commit_between_phases() {
+    let mut pf = CowFile::from_vec(vec![0u8; 100]);
+
+    // Phase 1: write and commit.
+    pf.write(0, &[0xAA; 10]).unwrap();
+    pf.commit().unwrap();
+
+    // Phase 2: read committed data, write new patches.
+    let view = pf.data();
+    assert_eq!(view[0], 0xAA);
+    assert_eq!(view[10], 0x00);
+
+    pf.write(10, &[0xBB; 10]).unwrap();
+
+    // data() still shows only phase 1 commits.
+    assert_eq!(pf.data()[10], 0x00);
+
+    // read() composites phase 2 pending.
+    assert_eq!(pf.read_byte(10).unwrap(), 0xBB);
+
+    // Commit phase 2.
+    pf.commit().unwrap();
+    assert_eq!(pf.data()[10], 0xBB);
+}
+
+#[test]
+fn test_discard_pending() {
+    let mut pf = CowFile::from_vec(vec![0u8; 50]);
+
+    pf.write(0, &[0xFF; 50]).unwrap();
+    assert!(pf.has_pending());
+
+    pf.discard();
+    assert!(!pf.has_pending());
+
+    // All data should still be zeros.
+    assert_eq!(pf.data(), &vec![0u8; 50][..]);
+    assert_eq!(pf.read_byte(0).unwrap(), 0x00);
 }
 
 #[test]
@@ -89,10 +166,10 @@ fn test_deobfuscation_simulation() {
         *byte = (i ^ 0xAA) as u8;
     }
 
-    let pf = CowFile::from_vec(base);
+    let mut pf = CowFile::from_vec(base);
 
     // Pass 1: "Decrypt" the first section (bytes 0..1024).
-    for i in 0..1024u64 {
+    for i in 0..1024 {
         let original = pf.read_byte(i).unwrap();
         let decrypted = original ^ 0xAA;
         pf.write_byte(i, decrypted).unwrap();
@@ -100,7 +177,7 @@ fn test_deobfuscation_simulation() {
     pf.commit().unwrap();
 
     // Pass 2: "Decrypt" the second section (bytes 1024..2048).
-    for i in 1024..2048u64 {
+    for i in 1024..2048 {
         let original = pf.read_byte(i).unwrap();
         let decrypted = original ^ 0xAA;
         pf.write_byte(i, decrypted).unwrap();
@@ -108,7 +185,7 @@ fn test_deobfuscation_simulation() {
     pf.commit().unwrap();
 
     // Pass 3: "Decrypt" the rest.
-    for i in 2048..4096u64 {
+    for i in 2048..4096 {
         let original = pf.read_byte(i).unwrap();
         let decrypted = original ^ 0xAA;
         pf.write_byte(i, decrypted).unwrap();
@@ -116,7 +193,7 @@ fn test_deobfuscation_simulation() {
     pf.commit().unwrap();
 
     // Verify all bytes are "decrypted" (should be sequential indices).
-    let output = pf.to_vec().unwrap();
+    let output = pf.to_vec();
     for (i, &byte) in output.iter().enumerate() {
         assert_eq!(byte, (i % 256) as u8, "mismatch at offset {i}");
     }
@@ -124,7 +201,7 @@ fn test_deobfuscation_simulation() {
 
 #[test]
 fn test_to_file_matches_to_vec() {
-    let pf = CowFile::from_vec(vec![0u8; 500]);
+    let mut pf = CowFile::from_vec(vec![0u8; 500]);
 
     // Apply various modifications.
     pf.write(0, &[0xAA, 0xBB, 0xCC]).unwrap();
@@ -133,7 +210,7 @@ fn test_to_file_matches_to_vec() {
     pf.write(200, &[0xFF]).unwrap();
 
     // Get both outputs.
-    let vec_output = pf.to_vec().unwrap();
+    let vec_output = pf.to_vec();
 
     let tmpfile = tempfile::NamedTempFile::new().unwrap();
     pf.to_file(tmpfile.path()).unwrap();
@@ -151,7 +228,7 @@ fn test_mmap_to_file_roundtrip() {
     tmpfile.flush().unwrap();
 
     // Open with cowfile, modify, write to new file.
-    let pf = CowFile::from_path(tmpfile.path()).unwrap();
+    let mut pf = CowFile::open(tmpfile.path()).unwrap();
     pf.write(0, &[0x4D, 0x5A]).unwrap();
     pf.write(128, &[0xFF; 16]).unwrap();
     pf.commit().unwrap();
@@ -160,7 +237,7 @@ fn test_mmap_to_file_roundtrip() {
     pf.to_file(outfile.path()).unwrap();
 
     // Open the output file with cowfile and verify.
-    let pf2 = CowFile::from_path(outfile.path()).unwrap();
+    let pf2 = CowFile::open(outfile.path()).unwrap();
     assert_eq!(pf2.len(), 256);
     assert_eq!(pf2.read(0, 2).unwrap(), vec![0x4D, 0x5A]);
     assert_eq!(pf2.read(128, 16).unwrap(), vec![0xFF; 16]);
@@ -168,43 +245,8 @@ fn test_mmap_to_file_roundtrip() {
 }
 
 #[test]
-fn test_concurrent_read_write_isolation() {
-    // Verify that reads from one thread see a consistent snapshot
-    // even when another thread is writing.
-    let pf = Arc::new(CowFile::from_vec(vec![0u8; 1000]));
-
-    // Fill with initial pattern and commit.
-    for i in 0..1000u64 {
-        pf.write_byte(i, 0xAA).unwrap();
-    }
-    pf.commit().unwrap();
-
-    let pf_reader = Arc::clone(&pf);
-    let pf_writer = Arc::clone(&pf);
-
-    let reader = thread::spawn(move || {
-        for _ in 0..500 {
-            let data = pf_reader.read(0, 1000).unwrap();
-            // Every byte should be either 0xAA (committed) or 0xBB (pending write).
-            for &byte in &data {
-                assert!(byte == 0xAA || byte == 0xBB, "unexpected byte: {byte:#04X}");
-            }
-        }
-    });
-
-    let writer = thread::spawn(move || {
-        for i in 0..1000u64 {
-            pf_writer.write_byte(i, 0xBB).unwrap();
-        }
-    });
-
-    writer.join().unwrap();
-    reader.join().unwrap();
-}
-
-#[test]
 fn test_overlapping_write_regions() {
-    let pf = CowFile::from_vec(vec![0u8; 20]);
+    let mut pf = CowFile::from_vec(vec![0u8; 20]);
 
     // Write overlapping regions in the same pass.
     pf.write(0, &[0xAA; 10]).unwrap(); // [0..10)
@@ -219,13 +261,13 @@ fn test_overlapping_write_regions() {
     pf.commit().unwrap();
 
     // After commit, result should be the same.
-    let committed = pf.to_vec().unwrap();
+    let committed = pf.to_vec();
     assert_eq!(&committed[..], &data[..]);
 }
 
 #[test]
 fn test_overwrite_committed_with_pending() {
-    let pf = CowFile::from_vec(vec![0u8; 10]);
+    let mut pf = CowFile::from_vec(vec![0u8; 10]);
 
     // Commit some data.
     pf.write(0, &[0xAA; 5]).unwrap();
@@ -239,7 +281,7 @@ fn test_overwrite_committed_with_pending() {
 
     // Commit again and verify.
     pf.commit().unwrap();
-    let output = pf.to_vec().unwrap();
+    let output = pf.to_vec();
     assert_eq!(&output[0..5], &[0xAA, 0xAA, 0xBB, 0xBB, 0xBB]);
     assert_eq!(&output[5..10], &[0x00; 5]);
 }
@@ -261,13 +303,13 @@ fn test_error_types() {
     assert!(msg.contains("offset 10"));
 
     // Nonexistent file.
-    let err = CowFile::from_path("/this/does/not/exist.bin").unwrap_err();
+    let err = CowFile::open("/this/does/not/exist.bin").unwrap_err();
     assert!(matches!(err, cowfile::Error::Io(_)));
 }
 
 #[test]
 fn test_typed_io_multipass() {
-    let pf = CowFile::from_vec(vec![0u8; 64]);
+    let mut pf = CowFile::from_vec(vec![0u8; 64]);
 
     // Pass 1: Write header fields.
     pf.write_le::<u32>(0, 0x4D5A9000).unwrap();
@@ -292,7 +334,7 @@ fn test_typed_io_with_mmap() {
     tmpfile.write_all(&[0u8; 64]).unwrap();
     tmpfile.flush().unwrap();
 
-    let pf = CowFile::from_path(tmpfile.path()).unwrap();
+    let mut pf = CowFile::open(tmpfile.path()).unwrap();
     pf.write_le::<u32>(0, 0xDEADBEEF).unwrap();
     pf.write_le::<u16>(4, 42).unwrap();
     pf.commit().unwrap();
@@ -311,7 +353,7 @@ fn test_read_write_type_roundtrip() {
     }
 
     impl ReadFrom for ImageHeader {
-        fn read_from(pf: &CowFile, offset: u64) -> cowfile::Result<Self> {
+        fn read_from(pf: &CowFile, offset: usize) -> cowfile::Result<Self> {
             Ok(ImageHeader {
                 width: pf.read_le::<u32>(offset)?,
                 height: pf.read_le::<u32>(offset + 4)?,
@@ -322,7 +364,7 @@ fn test_read_write_type_roundtrip() {
     }
 
     impl WriteTo for ImageHeader {
-        fn write_to(&self, pf: &CowFile, offset: u64) -> cowfile::Result<()> {
+        fn write_to(&self, pf: &CowFile, offset: usize) -> cowfile::Result<()> {
             pf.write_le::<u32>(offset, self.width)?;
             pf.write_le::<u32>(offset + 4, self.height)?;
             pf.write_le::<u16>(offset + 8, self.bpp)?;
@@ -331,7 +373,7 @@ fn test_read_write_type_roundtrip() {
         }
     }
 
-    let pf = CowFile::from_vec(vec![0u8; 64]);
+    let mut pf = CowFile::from_vec(vec![0u8; 64]);
 
     let header = ImageHeader {
         width: 1920,
@@ -413,7 +455,7 @@ fn test_cursor_multiple_independent() {
     c1.write_all(&[0xAA; 8]).unwrap();
     c2.write_all(&[0xBB; 8]).unwrap();
 
-    let output = pf.to_vec().unwrap();
+    let output = pf.to_vec();
     assert!(output[..8].iter().all(|&b| b == 0xAA));
     assert!(output[8..16].iter().all(|&b| b == 0x00));
     assert!(output[16..24].iter().all(|&b| b == 0xBB));
@@ -436,7 +478,7 @@ fn test_three_layer_composition() {
     // Base has sequential pattern, committed overwrites middle, pending overwrites
     // a range that partially overlaps both committed and base.
     let base: Vec<u8> = (0..32).collect();
-    let pf = CowFile::from_vec(base);
+    let mut pf = CowFile::from_vec(base);
 
     // Committed: overwrite [8..16) with 0xAA.
     pf.write(8, &[0xAA; 8]).unwrap();
@@ -461,7 +503,7 @@ fn test_three_layer_composition() {
 #[test]
 fn test_commit_merges_overlapping_committed_entries() {
     // Two passes where committed entries from different passes overlap.
-    let pf = CowFile::from_vec(vec![0u8; 30]);
+    let mut pf = CowFile::from_vec(vec![0u8; 30]);
 
     // Pass 1: Two separate regions.
     pf.write(0, &[0xAA; 5]).unwrap();
@@ -473,7 +515,7 @@ fn test_commit_merges_overlapping_committed_entries() {
     pf.commit().unwrap();
 
     // Verify final output.
-    let output = pf.to_vec().unwrap();
+    let output = pf.to_vec();
     assert!(output[..3].iter().all(|&b| b == 0xAA));
     assert!(output[3..12].iter().all(|&b| b == 0xCC));
     assert!(output[12..15].iter().all(|&b| b == 0xBB));
@@ -482,7 +524,7 @@ fn test_commit_merges_overlapping_committed_entries() {
 
 #[test]
 fn test_pending_fully_covering_committed() {
-    let pf = CowFile::from_vec(vec![0u8; 20]);
+    let mut pf = CowFile::from_vec(vec![0u8; 20]);
 
     // Commit a small region.
     pf.write(5, &[0xAA; 5]).unwrap();
@@ -491,13 +533,13 @@ fn test_pending_fully_covering_committed() {
     // Pending write that entirely covers it.
     pf.write(0, &[0xBB; 20]).unwrap();
 
-    let output = pf.to_vec().unwrap();
+    let output = pf.to_vec();
     assert!(output.iter().all(|&b| b == 0xBB));
 }
 
 #[test]
 fn test_single_byte_operations_overlap() {
-    let pf = CowFile::from_vec(vec![0u8; 10]);
+    let mut pf = CowFile::from_vec(vec![0u8; 10]);
 
     // Write single bytes to the same offset across commit boundaries.
     pf.write_byte(5, 0xAA).unwrap();
@@ -510,4 +552,78 @@ fn test_single_byte_operations_overlap() {
 
     pf.commit().unwrap();
     assert_eq!(pf.read_byte(5).unwrap(), 0xCC);
+}
+
+#[test]
+fn test_dirty_flag_optimization() {
+    let mut pf = CowFile::from_vec(vec![1, 2, 3, 4, 5]);
+
+    // No pending writes — dirty flag is false.
+    assert!(!pf.has_pending());
+
+    // read() should return committed data directly.
+    assert_eq!(pf.read(0, 5).unwrap(), vec![1, 2, 3, 4, 5]);
+
+    // After a write, dirty flag is true.
+    pf.write(0, &[0xFF]).unwrap();
+    assert!(pf.has_pending());
+
+    // After commit, dirty flag is false again.
+    pf.commit().unwrap();
+    assert!(!pf.has_pending());
+
+    // After discard, dirty flag is false.
+    pf.write(0, &[0xEE]).unwrap();
+    assert!(pf.has_pending());
+    pf.discard();
+    assert!(!pf.has_pending());
+}
+
+#[test]
+fn test_into_vec() {
+    // Unmodified Vec — zero-copy move.
+    let pf = CowFile::from_vec(vec![1, 2, 3]);
+    let data = pf.into_vec();
+    assert_eq!(data, vec![1, 2, 3]);
+
+    // Modified Vec — materializes with pending applied.
+    let pf = CowFile::from_vec(vec![0u8; 10]);
+    pf.write(0, &[0xFF]).unwrap();
+    pf.write(9, &[0xEE]).unwrap();
+    let data = pf.into_vec();
+    assert_eq!(data[0], 0xFF);
+    assert_eq!(data[9], 0xEE);
+    assert_eq!(data[5], 0x00);
+
+    // Mmap — copies to Vec.
+    let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+    tmpfile.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+    tmpfile.flush().unwrap();
+
+    let pf = CowFile::open(tmpfile.path()).unwrap();
+    let data = pf.into_vec();
+    assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+}
+
+#[test]
+fn test_empty_file() {
+    let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+    tmpfile.flush().unwrap();
+
+    let pf = CowFile::open(tmpfile.path()).unwrap();
+    assert_eq!(pf.len(), 0);
+    assert!(pf.is_empty());
+    assert_eq!(pf.data(), &[] as &[u8]);
+}
+
+#[test]
+fn test_from_file() {
+    let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+    tmpfile.write_all(&[0xCA, 0xFE]).unwrap();
+    tmpfile.flush().unwrap();
+
+    let file = std::fs::File::open(tmpfile.path()).unwrap();
+    let pf = CowFile::from_file(file).unwrap();
+    assert_eq!(pf.len(), 2);
+    assert_eq!(pf.data(), &[0xCA, 0xFE]);
 }

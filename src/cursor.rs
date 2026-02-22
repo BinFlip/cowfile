@@ -52,7 +52,7 @@ use crate::cowfile::CowFile;
 /// ```
 pub struct CowFileCursor<'a> {
     cowfile: &'a CowFile,
-    position: u64,
+    position: usize,
 }
 
 impl<'a> CowFileCursor<'a> {
@@ -65,12 +65,12 @@ impl<'a> CowFileCursor<'a> {
     }
 
     /// Returns the current byte position of the cursor.
-    pub fn position(&self) -> u64 {
+    pub fn position(&self) -> usize {
         self.position
     }
 
     /// Sets the cursor position directly.
-    pub fn set_position(&mut self, pos: u64) {
+    pub fn set_position(&mut self, pos: usize) {
         self.position = pos;
     }
 }
@@ -78,17 +78,17 @@ impl<'a> CowFileCursor<'a> {
 impl Read for CowFileCursor<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let remaining = self.cowfile.len().saturating_sub(self.position);
-        let to_read = (buf.len() as u64).min(remaining) as usize;
+        let to_read = buf.len().min(remaining);
         if to_read == 0 {
             return Ok(0);
         }
 
         let data = self
             .cowfile
-            .read(self.position, to_read as u64)
+            .read(self.position, to_read)
             .map_err(io::Error::other)?;
         buf[..to_read].copy_from_slice(&data);
-        self.position += to_read as u64;
+        self.position += to_read;
         Ok(to_read)
     }
 }
@@ -102,7 +102,7 @@ impl Write for CowFileCursor<'_> {
         self.cowfile
             .write(self.position, buf)
             .map_err(io::Error::other)?;
-        self.position += buf.len() as u64;
+        self.position += buf.len();
         Ok(buf.len())
     }
 
@@ -126,8 +126,8 @@ impl Seek for CowFileCursor<'_> {
             ));
         }
 
-        self.position = new_pos as u64;
-        Ok(self.position)
+        self.position = new_pos as usize;
+        Ok(self.position as u64)
     }
 }
 
@@ -260,7 +260,7 @@ mod tests {
         let copied = std::io::copy(&mut src_cursor, &mut dst_cursor).unwrap();
         assert_eq!(copied, 8);
 
-        let output = dst.to_vec().unwrap();
+        let output = dst.to_vec();
         assert_eq!(output, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 

@@ -1,9 +1,9 @@
 [package]
 name = "cowfile"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Johann Kempter <admin@binflip.rs>"]
 edition = "2021"
-description = "A copy-on-write overlay layer for immutable binary data"
+description = "A copy-on-write abstraction for binary data backed by memory or files"
 license = "Apache-2.0"
 repository = "https://github.com/BinFlip/cowfile"
 homepage = "https://github.com/BinFlip/cowfile"

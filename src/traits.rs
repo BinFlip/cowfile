@@ -16,7 +16,7 @@
 //! }
 //!
 //! impl ReadFrom for Header {
-//!     fn read_from(pf: &CowFile, offset: u64) -> Result<Self> {
+//!     fn read_from(pf: &CowFile, offset: usize) -> Result<Self> {
 //!         Ok(Header {
 //!             magic: pf.read_le::<u32>(offset)?,
 //!             version: pf.read_le::<u16>(offset + 4)?,
@@ -25,7 +25,7 @@
 //! }
 //!
 //! impl WriteTo for Header {
-//!     fn write_to(&self, pf: &CowFile, offset: u64) -> Result<()> {
+//!     fn write_to(&self, pf: &CowFile, offset: usize) -> Result<()> {
 //!         pf.write_le::<u32>(offset, self.magic)?;
 //!         pf.write_le::<u16>(offset + 4, self.version)?;
 //!         Ok(())
@@ -59,7 +59,7 @@ use crate::{cowfile::CowFile, error::Result};
 /// }
 ///
 /// impl ReadFrom for Pair {
-///     fn read_from(pf: &CowFile, offset: u64) -> Result<Self> {
+///     fn read_from(pf: &CowFile, offset: usize) -> Result<Self> {
 ///         Ok(Pair {
 ///             a: pf.read_le::<u32>(offset)?,
 ///             b: pf.read_le::<u32>(offset + 4)?,
@@ -73,7 +73,7 @@ pub trait ReadFrom: Sized {
     /// # Errors
     ///
     /// Returns an error if the underlying reads fail (e.g., out of bounds).
-    fn read_from(cowfile: &CowFile, offset: u64) -> Result<Self>;
+    fn read_from(cowfile: &CowFile, offset: usize) -> Result<Self>;
 }
 
 /// Trait for types that can be serialized into a [`CowFile`] at a given offset.
@@ -92,7 +92,7 @@ pub trait ReadFrom: Sized {
 /// }
 ///
 /// impl WriteTo for Pair {
-///     fn write_to(&self, pf: &CowFile, offset: u64) -> Result<()> {
+///     fn write_to(&self, pf: &CowFile, offset: usize) -> Result<()> {
 ///         pf.write_le::<u32>(offset, self.a)?;
 ///         pf.write_le::<u32>(offset + 4, self.b)?;
 ///         Ok(())
@@ -105,5 +105,5 @@ pub trait WriteTo {
     /// # Errors
     ///
     /// Returns an error if the underlying writes fail (e.g., out of bounds).
-    fn write_to(&self, cowfile: &CowFile, offset: u64) -> Result<()>;
+    fn write_to(&self, cowfile: &CowFile, offset: usize) -> Result<()>;
 }

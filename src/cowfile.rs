@@ -1,115 +1,152 @@
-//! The main [`CowFile`] type combining an immutable backend with a copy-on-write overlay.
+//! The main [`CowFile`] type with OS-level copy-on-write and a pending write log.
 //!
-//! `CowFile` is the primary public API of this crate. It wraps immutable binary data
-//! (from a [`Vec<u8>`] or a memory-mapped file) with a sparse overlay that tracks
-//! byte-level modifications without ever mutating the original data.
+//! `CowFile` wraps binary data (from a [`Vec<u8>`] or a copy-on-write memory map)
+//! with a pending log that tracks writes. The committed buffer is accessible as
+//! `&[u8]` via [`data`](CowFile::data), while [`read`](CowFile::read) and typed
+//! accessors composite pending writes over the committed state.
 //!
 //! # Thread Safety
 //!
-//! `CowFile` is [`Send`] + [`Sync`]. The immutable backend requires no synchronization,
-//! and the overlay is protected by an internal [`RwLock`](std::sync::RwLock) that allows
-//! concurrent reads with exclusive writes.
+//! `CowFile` is [`Send`] but not [`Sync`]. For shared concurrent access,
+//! wrap in `Arc<Mutex<CowFile>>`.
 
-use std::{fmt, io::Write, path::Path, sync::RwLock};
+use std::{
+    cell::{Cell, RefCell},
+    fmt,
+    io::Write,
+    path::Path,
+};
 
 use crate::{
-    backend::Backend,
     cursor::CowFileCursor,
     error::{Error, Result},
-    overlay::Overlay,
     primitives::Primitive,
     traits::{ReadFrom, WriteTo},
 };
 
 /// Threshold above which [`to_file`](CowFile::to_file) uses a writable memory map
 /// instead of buffered I/O. Set to 64 MiB.
-const MMAP_WRITE_THRESHOLD: u64 = 64 * 1024 * 1024;
+const MMAP_WRITE_THRESHOLD: usize = 64 * 1024 * 1024;
 
-/// A patchable file providing copy-on-write overlay semantics over immutable binary data.
+/// Inner storage for `CowFile`.
+enum Inner {
+    /// Owned byte vector, directly mutable.
+    Vec(Vec<u8>),
+    /// Copy-on-write memory map (`MAP_PRIVATE`). Writes are process-private.
+    Mmap(memmap2::MmapMut),
+}
+
+impl Inner {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Inner::Vec(v) => v.as_slice(),
+            Inner::Mmap(m) => m,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Inner::Vec(v) => v.as_mut_slice(),
+            Inner::Mmap(m) => m.as_mut(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Inner::Vec(v) => v.len(),
+            Inner::Mmap(m) => m.len(),
+        }
+    }
+}
+
+/// A single pending write recorded in the log.
+struct PendingWrite {
+    offset: usize,
+    data: Vec<u8>,
+}
+
+/// A copy-on-write file abstraction backed by memory or a file.
 ///
-/// `CowFile` allows multiple modification passes over an immutable base layer without
-/// ever copying the full binary. Modifications are tracked as sparse overlays, and a
-/// final merged output is produced only when explicitly requested via [`to_vec`](CowFile::to_vec)
-/// or [`to_file`](CowFile::to_file).
+/// Writes accumulate in a pending log and are applied to the committed buffer
+/// on [`commit`](CowFile::commit). The committed buffer is accessible as
+/// `&[u8]` via [`data`](CowFile::data), while [`read`](CowFile::read) and
+/// typed I/O methods composite pending writes over the committed state.
 ///
 /// # Architecture
 ///
 /// ```text
-///  Base Layer (immutable)        Overlay (copy-on-write)
+///  Committed Buffer               Pending Log
 /// +---------------------+      +-------------------------+
-/// | Vec<u8> or Mmap     |      | committed: BTreeMap     |
-/// | (never modified)    | <--- | pending:   BTreeMap     |
+/// | Vec<u8> or MmapMut  | <--- | Vec<PendingWrite>       |
+/// | (OS-level CoW)      |      | (applied on commit)     |
 /// +---------------------+      +-------------------------+
 /// ```
 ///
-/// The overlay has two tiers:
-/// - **Pending**: Modifications from the current pass, not yet committed.
-/// - **Committed**: Consolidated modifications from previous [`commit`](CowFile::commit) calls.
-///
-/// When reading, layers are composited: **pending > committed > base**.
-///
-/// # Thread Safety
-///
-/// `CowFile` is `Send + Sync`. Multiple threads can read concurrently. Write access
-/// to the overlay is synchronized via an internal `RwLock`.
+/// For memory-mapped files, the buffer is created with
+/// [`map_copy`](memmap2::MmapOptions::map_copy), which uses `MAP_PRIVATE` on
+/// Unix and `PAGE_WRITECOPY` on Windows. Only pages touched by
+/// [`commit`](CowFile::commit) are copied into anonymous memory — the rest
+/// of the file remains demand-paged from disk.
 ///
 /// # Examples
 ///
 /// ```
 /// use cowfile::CowFile;
 ///
-/// // Create from owned bytes
 /// let pf = CowFile::from_vec(vec![0u8; 100]);
 ///
-/// // Apply modifications without copying the full buffer
+/// // Writes go to the pending log
 /// pf.write(10, &[0xFF, 0xFE]).unwrap();
-/// pf.write(20, &[0xAA, 0xBB, 0xCC]).unwrap();
 ///
-/// // Read back modified data
-/// let data = pf.read(10, 2).unwrap();
-/// assert_eq!(data, vec![0xFF, 0xFE]);
+/// // data() returns committed state
+/// assert_eq!(pf.data()[10], 0x00);
 ///
-/// // Commit consolidates pending changes
+/// // read() composites pending writes
+/// assert_eq!(pf.read_byte(10).unwrap(), 0xFF);
+///
+/// // Commit applies pending to the buffer
+/// let mut pf = pf;
 /// pf.commit().unwrap();
-///
-/// // More modifications in a second pass
-/// pf.write(30, &[0xDD]).unwrap();
-///
-/// // Produce final output with all modifications applied
-/// let output = pf.to_vec().unwrap();
-/// assert_eq!(output[10], 0xFF);
-/// assert_eq!(output[20], 0xAA);
-/// assert_eq!(output[30], 0xDD);
+/// assert_eq!(pf.data()[10], 0xFF);
 /// ```
 pub struct CowFile {
-    /// Immutable base data — never modified after construction.
-    backend: Backend,
-    /// Copy-on-write overlay behind RwLock for thread-safe access.
-    overlay: RwLock<Overlay>,
+    /// Committed buffer — only mutated by `commit()`.
+    buffer: Inner,
+    /// Pending writes, accumulated via interior mutability.
+    pending: RefCell<Vec<PendingWrite>>,
+    /// Fast check to skip empty pending iteration.
+    dirty: Cell<bool>,
 }
 
-impl fmt::Debug for CowFile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CowFile")
-            .field("backend", &self.backend)
-            .field("len", &self.backend.len())
-            .finish_non_exhaustive()
-    }
-}
-
-// Static assertion: CowFile must be Send + Sync.
+// Static assertion: CowFile must be Send.
 const _: () = {
-    fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send<T: Send>() {}
     fn check() {
-        assert_send_sync::<CowFile>();
+        assert_send::<CowFile>();
     }
     let _ = check;
 };
 
+impl fmt::Debug for CowFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CowFile")
+            .field("len", &self.buffer.len())
+            .field(
+                "backend",
+                &match &self.buffer {
+                    Inner::Vec(_) => "Vec",
+                    Inner::Mmap(_) => "Mmap",
+                },
+            )
+            .field("dirty", &self.dirty.get())
+            .finish_non_exhaustive()
+    }
+}
+
 impl CowFile {
     /// Creates a `CowFile` from an owned byte vector.
     ///
-    /// The provided bytes become the immutable base layer. No copies are made
+    /// The provided bytes become the committed buffer. No copies are made
     /// during construction — the vector is moved into the `CowFile`.
     ///
     /// # Examples
@@ -122,16 +159,18 @@ impl CowFile {
     /// ```
     pub fn from_vec(data: Vec<u8>) -> Self {
         CowFile {
-            backend: Backend::Vec(data),
-            overlay: RwLock::new(Overlay::new()),
+            buffer: Inner::Vec(data),
+            pending: RefCell::new(Vec::new()),
+            dirty: Cell::new(false),
         }
     }
 
     /// Creates a `CowFile` by memory-mapping a file from the given path.
     ///
-    /// The file is mapped read-only into the process address space. The operating
-    /// system handles paging, so only accessed regions are loaded into physical
-    /// memory. This is ideal for large binaries.
+    /// The file is mapped with copy-on-write semantics (`MAP_PRIVATE` on Unix,
+    /// `PAGE_WRITECOPY` on Windows). The original file is never modified.
+    /// Only pages touched by [`commit`](CowFile::commit) are copied into
+    /// anonymous memory — the rest of the file remains demand-paged from disk.
     ///
     /// # Errors
     ///
@@ -142,34 +181,63 @@ impl CowFile {
     /// ```no_run
     /// use cowfile::CowFile;
     ///
-    /// let pf = CowFile::from_path("binary.exe").unwrap();
+    /// let pf = CowFile::open("binary.exe").unwrap();
     /// println!("File size: {} bytes", pf.len());
     /// ```
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
-        let backend = Backend::from_path(path)?;
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let file = std::fs::File::open(path.as_ref())?;
+        Self::from_file(file)
+    }
+
+    /// Creates a `CowFile` from an already-opened [`std::fs::File`].
+    ///
+    /// The file is mapped with copy-on-write semantics. The original file is
+    /// never modified.
+    ///
+    /// Empty files (0 bytes) are handled by using a `Vec` backend instead of
+    /// mmap, since memory-mapping an empty file is not supported on all
+    /// platforms.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the file cannot be memory-mapped.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use cowfile::CowFile;
+    ///
+    /// let file = std::fs::File::open("binary.exe").unwrap();
+    /// let pf = CowFile::from_file(file).unwrap();
+    /// println!("File size: {} bytes", pf.len());
+    /// ```
+    pub fn from_file(file: std::fs::File) -> Result<Self> {
+        let metadata = file.metadata()?;
+        if metadata.len() == 0 {
+            return Ok(Self::from_vec(Vec::new()));
+        }
+
+        // SAFETY: We use map_copy which creates a private CoW mapping.
+        // The file must not be modified externally while the mapping is alive.
+        // This is the same contract as any memory-mapped file in Rust.
+        let mmap = unsafe { memmap2::MmapOptions::new().map_copy(&file)? };
         Ok(CowFile {
-            backend,
-            overlay: RwLock::new(Overlay::new()),
+            buffer: Inner::Mmap(mmap),
+            pending: RefCell::new(Vec::new()),
+            dirty: Cell::new(false),
         })
     }
 
-    /// Returns the total length of the base data in bytes.
+    /// Returns the committed buffer as a byte slice.
     ///
-    /// This reflects the original, unmodified size. Modifications do not change
-    /// the length (writes beyond the end are rejected as out-of-bounds).
-    pub fn len(&self) -> u64 {
-        self.backend.len()
-    }
-
-    /// Returns `true` if the base data is empty (zero bytes).
-    pub fn is_empty(&self) -> bool {
-        self.backend.len() == 0
-    }
-
-    /// Returns the unmodified base data as a byte slice.
+    /// This is a true zero-cost `&[u8]` reference into the committed buffer.
+    /// For mmap-backed files, only accessed pages are loaded into physical
+    /// memory by the OS.
     ///
-    /// This returns the raw base data without any overlay applied. Useful for
-    /// comparing the original against the modified version.
+    /// Pending writes are **not** visible through this method. Use
+    /// [`read`](CowFile::read) or [`read_le`](CowFile::read_le) for a view
+    /// that composites pending writes, or call [`commit`](CowFile::commit)
+    /// first.
     ///
     /// # Examples
     ///
@@ -177,49 +245,49 @@ impl CowFile {
     /// use cowfile::CowFile;
     ///
     /// let pf = CowFile::from_vec(vec![1, 2, 3]);
-    /// pf.write(0, &[0xFF]).unwrap();
-    /// assert_eq!(pf.base_data(), &[1, 2, 3]); // Base is unchanged
+    /// let data: &[u8] = pf.data();
+    /// assert_eq!(data, &[1, 2, 3]);
     /// ```
-    pub fn base_data(&self) -> &[u8] {
-        self.backend.as_slice()
+    pub fn data(&self) -> &[u8] {
+        self.buffer.as_slice()
     }
 
-    /// Returns `true` if there are uncommitted (pending) modifications.
+    /// Returns the total length of the data in bytes.
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Returns `true` if the data is empty (zero bytes).
+    pub fn is_empty(&self) -> bool {
+        self.buffer.len() == 0
+    }
+
+    /// Returns `true` if there are uncommitted pending writes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cowfile::CowFile;
+    ///
+    /// let pf = CowFile::from_vec(vec![0u8; 10]);
+    /// assert!(!pf.has_pending());
+    ///
+    /// pf.write(0, &[0xFF]).unwrap();
+    /// assert!(pf.has_pending());
+    /// ```
+    pub fn has_pending(&self) -> bool {
+        self.dirty.get()
+    }
+
+    /// Reads `length` bytes starting at `offset`, compositing pending writes.
+    ///
+    /// The returned bytes reflect pending writes applied over the committed
+    /// buffer. When there are no pending writes, this is equivalent to
+    /// slicing [`data`](CowFile::data).
     ///
     /// # Errors
     ///
-    /// Returns [`Error::LockPoisoned`] if the overlay lock is poisoned.
-    pub fn has_pending(&self) -> Result<bool> {
-        let guard = self
-            .overlay
-            .read()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
-        Ok(guard.has_pending())
-    }
-
-    /// Returns `true` if there are any modifications (pending or committed).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::LockPoisoned`] if the overlay lock is poisoned.
-    pub fn has_modifications(&self) -> Result<bool> {
-        let guard = self
-            .overlay
-            .read()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
-        Ok(guard.has_modifications())
-    }
-
-    /// Reads `length` bytes starting at `offset`, applying all modifications.
-    ///
-    /// The returned bytes reflect the composition of committed modifications,
-    /// pending modifications, and unmodified base data. Priority order:
-    /// **pending > committed > base** (later layers overwrite earlier ones).
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::OutOfBounds`] if the requested range exceeds the base data size.
-    /// - [`Error::LockPoisoned`] if the overlay lock is poisoned.
+    /// Returns [`Error::OutOfBounds`] if the requested range exceeds the data size.
     ///
     /// # Examples
     ///
@@ -232,23 +300,28 @@ impl CowFile {
     /// let data = pf.read(1, 3).unwrap();
     /// assert_eq!(data, vec![2, 0xFF, 4]);
     /// ```
-    pub fn read(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
+    pub fn read(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
         self.check_bounds(offset, length)?;
 
-        let guard = self
-            .overlay
-            .read()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
+        if length == 0 {
+            return Ok(Vec::new());
+        }
 
-        Ok(guard.read(offset, length, self.backend.as_slice()))
+        let mut buf = self.buffer.as_slice()[offset..offset + length].to_vec();
+
+        if self.dirty.get() {
+            let pending = self.pending.borrow();
+            apply_pending(&mut buf, offset, length, &pending);
+        }
+
+        Ok(buf)
     }
 
-    /// Reads a single byte at the given offset, applying all modifications.
+    /// Reads a single byte at the given offset, compositing pending writes.
     ///
     /// # Errors
     ///
-    /// - [`Error::OutOfBounds`] if the offset is beyond the file size.
-    /// - [`Error::LockPoisoned`] if the overlay lock is poisoned.
+    /// Returns [`Error::OutOfBounds`] if the offset is beyond the data size.
     ///
     /// # Examples
     ///
@@ -261,23 +334,34 @@ impl CowFile {
     /// pf.write_byte(1, 0xFF).unwrap();
     /// assert_eq!(pf.read_byte(1).unwrap(), 0xFF);
     /// ```
-    pub fn read_byte(&self, offset: u64) -> Result<u8> {
-        let data = self.read(offset, 1)?;
-        Ok(data[0])
+    pub fn read_byte(&self, offset: usize) -> Result<u8> {
+        self.check_bounds(offset, 1)?;
+
+        if self.dirty.get() {
+            let pending = self.pending.borrow();
+            // Scan in reverse — last write wins.
+            for pw in pending.iter().rev() {
+                let pw_end = pw.offset + pw.data.len();
+                if offset >= pw.offset && offset < pw_end {
+                    return Ok(pw.data[offset - pw.offset]);
+                }
+            }
+        }
+
+        Ok(self.buffer.as_slice()[offset])
     }
 
-    /// Writes `data` at the given `offset` into the pending overlay.
+    /// Writes `data` at the given `offset` into the pending log.
     ///
-    /// The base data is never modified. This records the modification in the
-    /// pending layer, which takes priority over committed data and base data
-    /// when reading.
+    /// The committed buffer is not modified. Pending writes are composited
+    /// into reads via [`read`](CowFile::read) and applied to the buffer on
+    /// [`commit`](CowFile::commit).
     ///
     /// Empty writes (zero-length data) are silently ignored.
     ///
     /// # Errors
     ///
-    /// - [`Error::OutOfBounds`] if the write extends beyond the base data size.
-    /// - [`Error::LockPoisoned`] if the overlay lock is poisoned.
+    /// Returns [`Error::OutOfBounds`] if the write extends beyond the data size.
     ///
     /// # Examples
     ///
@@ -290,154 +374,98 @@ impl CowFile {
     /// let data = pf.read(50, 4).unwrap();
     /// assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     /// ```
-    pub fn write(&self, offset: u64, data: &[u8]) -> Result<()> {
+    pub fn write(&self, offset: usize, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
 
-        self.check_bounds(offset, data.len() as u64)?;
+        self.check_bounds(offset, data.len())?;
 
-        let mut guard = self
-            .overlay
-            .write()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
-
-        guard.write(offset, data);
+        self.pending.borrow_mut().push(PendingWrite {
+            offset,
+            data: data.to_vec(),
+        });
+        self.dirty.set(true);
         Ok(())
     }
 
-    /// Writes a single byte at the given offset into the pending overlay.
+    /// Writes a single byte at the given offset into the pending log.
     ///
     /// # Errors
     ///
-    /// - [`Error::OutOfBounds`] if the offset is beyond the file size.
-    /// - [`Error::LockPoisoned`] if the overlay lock is poisoned.
-    pub fn write_byte(&self, offset: u64, byte: u8) -> Result<()> {
+    /// Returns [`Error::OutOfBounds`] if the offset is beyond the data size.
+    pub fn write_byte(&self, offset: usize, byte: u8) -> Result<()> {
         self.write(offset, &[byte])
     }
 
-    /// Merges all pending modifications into the committed overlay.
+    /// Applies all pending writes to the committed buffer and clears the log.
     ///
-    /// After this call, the pending layer is empty and the committed layer
-    /// contains the consolidated union of all previously committed and pending
-    /// modifications. Overlapping regions are resolved with later writes winning.
-    ///
-    /// Multiple commit cycles are supported:
-    /// ```text
-    /// modify → commit → modify → commit → ... → to_vec / to_file
-    /// ```
+    /// For mmap-backed files, only the OS pages touched by writes are copied
+    /// into anonymous memory (`MAP_PRIVATE` CoW). The rest of the file remains
+    /// demand-paged from disk.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::LockPoisoned`] if the overlay lock is poisoned.
+    /// Returns [`Error::OutOfBounds`] if any pending write is out of bounds
+    /// (should not happen if writes were bounds-checked).
     ///
     /// # Examples
     ///
     /// ```
     /// use cowfile::CowFile;
     ///
-    /// let pf = CowFile::from_vec(vec![0u8; 10]);
+    /// let mut pf = CowFile::from_vec(vec![0u8; 10]);
     ///
-    /// // Pass 1
     /// pf.write(0, &[0xAA]).unwrap();
-    /// pf.commit().unwrap();
-    /// assert!(!pf.has_pending().unwrap());
+    /// assert_eq!(pf.data()[0], 0x00); // Not yet committed
     ///
-    /// // Pass 2
-    /// pf.write(5, &[0xBB]).unwrap();
     /// pf.commit().unwrap();
-    ///
-    /// let output = pf.to_vec().unwrap();
-    /// assert_eq!(output[0], 0xAA);
-    /// assert_eq!(output[5], 0xBB);
+    /// assert_eq!(pf.data()[0], 0xAA); // Now committed
+    /// assert!(!pf.has_pending());
     /// ```
-    pub fn commit(&self) -> Result<()> {
-        let mut guard = self
-            .overlay
-            .write()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
+    pub fn commit(&mut self) -> Result<()> {
+        if !self.dirty.get() {
+            return Ok(());
+        }
 
-        guard.commit();
+        let pending = self.pending.get_mut();
+        let buf = self.buffer.as_mut_slice();
+
+        for pw in pending.drain(..) {
+            buf[pw.offset..pw.offset + pw.data.len()].copy_from_slice(&pw.data);
+        }
+
+        self.dirty.set(false);
         Ok(())
     }
 
-    /// Produces a `Vec<u8>` containing the full file with all modifications applied.
-    ///
-    /// This allocates a new vector of size [`len`](CowFile::len), copies the base data,
-    /// then patches in all committed and pending modifications.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::LockPoisoned`] if the overlay lock is poisoned.
+    /// Discards all pending writes without applying them.
     ///
     /// # Examples
     ///
     /// ```
     /// use cowfile::CowFile;
     ///
-    /// let pf = CowFile::from_vec(vec![1, 2, 3, 4, 5]);
+    /// let mut pf = CowFile::from_vec(vec![0u8; 10]);
     /// pf.write(0, &[0xFF]).unwrap();
+    /// assert!(pf.has_pending());
     ///
-    /// let output = pf.to_vec().unwrap();
-    /// assert_eq!(output, vec![0xFF, 2, 3, 4, 5]);
+    /// pf.discard();
+    /// assert!(!pf.has_pending());
+    /// assert_eq!(pf.data()[0], 0x00);
     /// ```
-    pub fn to_vec(&self) -> Result<Vec<u8>> {
-        let guard = self
-            .overlay
-            .read()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
-
-        Ok(guard.materialize(self.backend.as_slice()))
-    }
-
-    /// Writes the full file with all modifications applied to disk.
-    ///
-    /// For files smaller than 64 MiB, this uses buffered [`std::fs::File::write_all`].
-    /// For larger files, this uses a writable memory map ([`memmap2::MmapMut`]) for
-    /// efficient output without requiring the entire file in a contiguous `Vec<u8>`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Io`] if the file cannot be created or written.
-    /// Returns [`Error::LockPoisoned`] if the overlay lock is poisoned.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use cowfile::CowFile;
-    ///
-    /// let pf = CowFile::from_vec(vec![0u8; 1024]);
-    /// pf.write(0, &[0x4D, 0x5A]).unwrap();
-    /// pf.to_file("output.bin").unwrap();
-    /// ```
-    pub fn to_file(&self, path: impl AsRef<Path>) -> Result<()> {
-        let guard = self
-            .overlay
-            .read()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
-
-        let base = self.backend.as_slice();
-        let size = base.len() as u64;
-
-        if size >= MMAP_WRITE_THRESHOLD {
-            self.to_file_mmap(path.as_ref(), base, &guard)
-        } else {
-            let output = guard.materialize(base);
-            let mut file = std::fs::File::create(path.as_ref())?;
-            file.write_all(&output)?;
-            file.flush()?;
-            Ok(())
-        }
+    pub fn discard(&mut self) {
+        self.pending.get_mut().clear();
+        self.dirty.set(false);
     }
 
     /// Reads a primitive value in little-endian byte order at the given offset.
     ///
-    /// The number of bytes read equals [`Primitive::SIZE`] for the requested type.
+    /// Composites pending writes over the committed state.
     ///
     /// # Errors
     ///
-    /// - [`Error::OutOfBounds`] if there are not enough bytes at `offset`.
-    /// - [`Error::LockPoisoned`] if the overlay lock is poisoned.
+    /// Returns [`Error::OutOfBounds`] if there are not enough bytes at `offset`.
     ///
     /// # Examples
     ///
@@ -447,17 +475,18 @@ impl CowFile {
     /// let pf = CowFile::from_vec(vec![0xEF, 0xBE, 0xAD, 0xDE, 0, 0, 0, 0]);
     /// assert_eq!(pf.read_le::<u32>(0).unwrap(), 0xDEADBEEF);
     /// ```
-    pub fn read_le<T: Primitive>(&self, offset: u64) -> Result<T> {
-        let data = self.read(offset, T::SIZE as u64)?;
+    pub fn read_le<T: Primitive>(&self, offset: usize) -> Result<T> {
+        let data = self.read(offset, T::SIZE)?;
         Ok(T::from_le_bytes(&data))
     }
 
     /// Reads a primitive value in big-endian byte order at the given offset.
     ///
+    /// Composites pending writes over the committed state.
+    ///
     /// # Errors
     ///
-    /// - [`Error::OutOfBounds`] if there are not enough bytes at `offset`.
-    /// - [`Error::LockPoisoned`] if the overlay lock is poisoned.
+    /// Returns [`Error::OutOfBounds`] if there are not enough bytes at `offset`.
     ///
     /// # Examples
     ///
@@ -467,17 +496,18 @@ impl CowFile {
     /// let pf = CowFile::from_vec(vec![0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0]);
     /// assert_eq!(pf.read_be::<u32>(0).unwrap(), 0xDEADBEEF);
     /// ```
-    pub fn read_be<T: Primitive>(&self, offset: u64) -> Result<T> {
-        let data = self.read(offset, T::SIZE as u64)?;
+    pub fn read_be<T: Primitive>(&self, offset: usize) -> Result<T> {
+        let data = self.read(offset, T::SIZE)?;
         Ok(T::from_be_bytes(&data))
     }
 
     /// Writes a primitive value in little-endian byte order at the given offset.
     ///
+    /// The write goes to the pending log.
+    ///
     /// # Errors
     ///
-    /// - [`Error::OutOfBounds`] if there are not enough bytes at `offset`.
-    /// - [`Error::LockPoisoned`] if the overlay lock is poisoned.
+    /// Returns [`Error::OutOfBounds`] if there are not enough bytes at `offset`.
     ///
     /// # Examples
     ///
@@ -488,7 +518,7 @@ impl CowFile {
     /// pf.write_le::<u32>(0, 0xDEADBEEF).unwrap();
     /// assert_eq!(pf.read(0, 4).unwrap(), vec![0xEF, 0xBE, 0xAD, 0xDE]);
     /// ```
-    pub fn write_le<T: Primitive>(&self, offset: u64, value: T) -> Result<()> {
+    pub fn write_le<T: Primitive>(&self, offset: usize, value: T) -> Result<()> {
         let mut buf = vec![0u8; T::SIZE];
         value.write_le_bytes(&mut buf);
         self.write(offset, &buf)
@@ -496,10 +526,11 @@ impl CowFile {
 
     /// Writes a primitive value in big-endian byte order at the given offset.
     ///
+    /// The write goes to the pending log.
+    ///
     /// # Errors
     ///
-    /// - [`Error::OutOfBounds`] if there are not enough bytes at `offset`.
-    /// - [`Error::LockPoisoned`] if the overlay lock is poisoned.
+    /// Returns [`Error::OutOfBounds`] if there are not enough bytes at `offset`.
     ///
     /// # Examples
     ///
@@ -510,7 +541,7 @@ impl CowFile {
     /// pf.write_be::<u32>(0, 0xDEADBEEF).unwrap();
     /// assert_eq!(pf.read(0, 4).unwrap(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
     /// ```
-    pub fn write_be<T: Primitive>(&self, offset: u64, value: T) -> Result<()> {
+    pub fn write_be<T: Primitive>(&self, offset: usize, value: T) -> Result<()> {
         let mut buf = vec![0u8; T::SIZE];
         value.write_be_bytes(&mut buf);
         self.write(offset, &buf)
@@ -518,9 +549,7 @@ impl CowFile {
 
     /// Reads a user-defined type implementing [`ReadFrom`] at the given offset.
     ///
-    /// This delegates to [`ReadFrom::read_from`], which typically calls
-    /// [`read_le`](CowFile::read_le) / [`read_be`](CowFile::read_be) for
-    /// individual fields.
+    /// Composites pending writes over the committed state.
     ///
     /// # Errors
     ///
@@ -534,7 +563,7 @@ impl CowFile {
     /// struct Pair { a: u16, b: u16 }
     ///
     /// impl ReadFrom for Pair {
-    ///     fn read_from(pf: &CowFile, offset: u64) -> Result<Self> {
+    ///     fn read_from(pf: &CowFile, offset: usize) -> Result<Self> {
     ///         Ok(Pair {
     ///             a: pf.read_le::<u16>(offset)?,
     ///             b: pf.read_le::<u16>(offset + 2)?,
@@ -547,15 +576,13 @@ impl CowFile {
     /// assert_eq!(pair.a, 1);
     /// assert_eq!(pair.b, 2);
     /// ```
-    pub fn read_type<T: ReadFrom>(&self, offset: u64) -> Result<T> {
+    pub fn read_type<T: ReadFrom>(&self, offset: usize) -> Result<T> {
         T::read_from(self, offset)
     }
 
     /// Writes a user-defined type implementing [`WriteTo`] at the given offset.
     ///
-    /// This delegates to [`WriteTo::write_to`], which typically calls
-    /// [`write_le`](CowFile::write_le) / [`write_be`](CowFile::write_be) for
-    /// individual fields.
+    /// The write goes to the pending log.
     ///
     /// # Errors
     ///
@@ -569,7 +596,7 @@ impl CowFile {
     /// struct Pair { a: u16, b: u16 }
     ///
     /// impl WriteTo for Pair {
-    ///     fn write_to(&self, pf: &CowFile, offset: u64) -> Result<()> {
+    ///     fn write_to(&self, pf: &CowFile, offset: usize) -> Result<()> {
     ///         pf.write_le::<u16>(offset, self.a)?;
     ///         pf.write_le::<u16>(offset + 2, self.b)?;
     ///         Ok(())
@@ -580,7 +607,7 @@ impl CowFile {
     /// pf.write_type(0, &Pair { a: 1, b: 2 }).unwrap();
     /// assert_eq!(pf.read(0, 4).unwrap(), vec![0x01, 0x00, 0x02, 0x00]);
     /// ```
-    pub fn write_type<T: WriteTo>(&self, offset: u64, value: &T) -> Result<()> {
+    pub fn write_type<T: WriteTo>(&self, offset: usize, value: &T) -> Result<()> {
         value.write_to(self, offset)
     }
 
@@ -590,7 +617,8 @@ impl CowFile {
     /// [`std::io::Write`], and [`std::io::Seek`], allowing the `CowFile`
     /// to be used with any API that expects standard I/O traits.
     ///
-    /// Multiple cursors can exist over the same `CowFile` simultaneously.
+    /// Multiple cursors can exist over the same `CowFile` simultaneously,
+    /// each with its own independent position.
     ///
     /// # Examples
     ///
@@ -612,85 +640,70 @@ impl CowFile {
         CowFileCursor::new(self)
     }
 
-    /// Creates a `CowFile` from an already-opened [`std::fs::File`].
+    /// Produces a `Vec<u8>` with all pending writes composited over the
+    /// committed buffer.
     ///
-    /// The file is memory-mapped read-only into the process address space.
-    /// This is useful when you already have a file handle from specific
-    /// permissions or a special location.
+    /// # Examples
+    ///
+    /// ```
+    /// use cowfile::CowFile;
+    ///
+    /// let pf = CowFile::from_vec(vec![1, 2, 3, 4, 5]);
+    /// pf.write(0, &[0xFF]).unwrap();
+    ///
+    /// let output = pf.to_vec();
+    /// assert_eq!(output, vec![0xFF, 2, 3, 4, 5]);
+    /// ```
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut output = self.buffer.as_slice().to_vec();
+
+        if self.dirty.get() {
+            let pending = self.pending.borrow();
+            for pw in pending.iter() {
+                output[pw.offset..pw.offset + pw.data.len()].copy_from_slice(&pw.data);
+            }
+        }
+
+        output
+    }
+
+    /// Writes the data with all pending writes applied to disk.
+    ///
+    /// For files smaller than 64 MiB, this uses buffered I/O. For larger
+    /// files, this uses a writable memory map for efficient output.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Io`] if the file cannot be memory-mapped.
+    /// Returns [`Error::Io`] if the file cannot be created or written.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// use cowfile::CowFile;
     ///
-    /// let file = std::fs::File::open("binary.exe").unwrap();
-    /// let pf = CowFile::from_std_file(file).unwrap();
-    /// println!("File size: {} bytes", pf.len());
+    /// let pf = CowFile::from_vec(vec![0u8; 1024]);
+    /// pf.write(0, &[0x4D, 0x5A]).unwrap();
+    /// pf.to_file("output.bin").unwrap();
     /// ```
-    pub fn from_std_file(file: std::fs::File) -> Result<Self> {
-        // SAFETY: The file handle is valid and the mmap is read-only.
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        Ok(CowFile {
-            backend: Backend::Mmap(mmap),
-            overlay: RwLock::new(Overlay::new()),
-        })
-    }
+    pub fn to_file(&self, path: impl AsRef<Path>) -> Result<()> {
+        let size = self.buffer.len();
 
-    /// Folds all overlay modifications into the base data **in place**.
-    ///
-    /// After this call, [`base_data`](CowFile::base_data) returns bytes that
-    /// include all previously pending and committed overlay writes. The overlay
-    /// is cleared.
-    ///
-    /// This is useful when a downstream consumer (such as a PE parser) needs
-    /// contiguous `&[u8]` that includes modifications.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::LockPoisoned`] if the overlay lock is poisoned.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use cowfile::CowFile;
-    ///
-    /// let mut pf = CowFile::from_vec(vec![0u8; 10]);
-    /// pf.write(0, &[0xFF, 0xFE]).unwrap();
-    /// pf.consolidate().unwrap();
-    ///
-    /// // base_data() now includes the overlay writes
-    /// assert_eq!(pf.base_data()[0], 0xFF);
-    /// assert_eq!(pf.base_data()[1], 0xFE);
-    /// assert!(!pf.has_modifications().unwrap());
-    /// ```
-    pub fn consolidate(&mut self) -> Result<()> {
-        let overlay = self
-            .overlay
-            .get_mut()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
-
-        if !overlay.has_modifications() {
-            return Ok(());
+        if size >= MMAP_WRITE_THRESHOLD {
+            self.to_file_mmap(path.as_ref())
+        } else {
+            let output = self.to_vec();
+            let mut file = std::fs::File::create(path.as_ref())?;
+            file.write_all(&output)?;
+            file.flush()?;
+            Ok(())
         }
-
-        let materialized = overlay.materialize(self.backend.as_slice());
-        self.backend = Backend::Vec(materialized);
-        *overlay = Overlay::new();
-        Ok(())
     }
 
     /// Consumes the `CowFile` and returns the data as an owned `Vec<u8>`.
     ///
-    /// If there are no overlay modifications and the backend is a `Vec`,
-    /// this is a zero-copy move. Otherwise, the data is materialized.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::LockPoisoned`] if the overlay lock is poisoned.
+    /// If there are no pending writes and the backend is a `Vec`, this is a
+    /// zero-copy move. Otherwise, the data is materialized with pending writes
+    /// applied.
     ///
     /// # Examples
     ///
@@ -698,38 +711,45 @@ impl CowFile {
     /// use cowfile::CowFile;
     ///
     /// let pf = CowFile::from_vec(vec![1, 2, 3]);
-    /// let data = pf.into_vec().unwrap();
+    /// let data = pf.into_vec();
     /// assert_eq!(data, vec![1, 2, 3]);
     /// ```
-    pub fn into_vec(self) -> Result<Vec<u8>> {
-        let overlay = self
-            .overlay
-            .into_inner()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
+    pub fn into_vec(self) -> Vec<u8> {
+        let dirty = self.dirty.get();
 
-        if !overlay.has_modifications() {
-            return match self.backend {
-                Backend::Vec(v) => Ok(v),
-                Backend::Mmap(m) => Ok(m.as_ref().to_vec()),
+        if !dirty {
+            return match self.buffer {
+                Inner::Vec(v) => v,
+                Inner::Mmap(m) => m.as_ref().to_vec(),
             };
         }
 
-        Ok(overlay.materialize(self.backend.as_slice()))
+        let pending = self.pending.into_inner();
+        let mut output = match self.buffer {
+            Inner::Vec(v) => v,
+            Inner::Mmap(m) => m.as_ref().to_vec(),
+        };
+
+        for pw in pending {
+            output[pw.offset..pw.offset + pw.data.len()].copy_from_slice(&pw.data);
+        }
+
+        output
     }
 
-    /// Validates that `[offset, offset + length)` is within the base data bounds.
-    fn check_bounds(&self, offset: u64, length: u64) -> Result<()> {
+    /// Validates that `[offset, offset + length)` is within bounds.
+    fn check_bounds(&self, offset: usize, length: usize) -> Result<()> {
         let end = offset.checked_add(length).ok_or(Error::OutOfBounds {
             offset,
             length,
-            file_size: self.backend.len(),
+            file_size: self.buffer.len(),
         })?;
 
-        if end > self.backend.len() {
+        if end > self.buffer.len() {
             return Err(Error::OutOfBounds {
                 offset,
                 length,
-                file_size: self.backend.len(),
+                file_size: self.buffer.len(),
             });
         }
 
@@ -737,7 +757,8 @@ impl CowFile {
     }
 
     /// Writes to a file using a writable memory map (for large files).
-    fn to_file_mmap(&self, path: &Path, base: &[u8], overlay: &Overlay) -> Result<()> {
+    fn to_file_mmap(&self, path: &Path) -> Result<()> {
+        let base = self.buffer.as_slice();
         let size = base.len() as u64;
 
         let file = std::fs::OpenOptions::new()
@@ -753,20 +774,34 @@ impl CowFile {
         let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
         mmap.copy_from_slice(base);
 
-        // Apply committed layer.
-        for (&offset, data) in overlay.committed_entries() {
-            let start = offset as usize;
-            mmap[start..start + data.len()].copy_from_slice(data);
-        }
-
-        // Apply pending layer (overwrites committed where they overlap).
-        for (&offset, data) in overlay.pending_entries() {
-            let start = offset as usize;
-            mmap[start..start + data.len()].copy_from_slice(data);
+        if self.dirty.get() {
+            let pending = self.pending.borrow();
+            for pw in pending.iter() {
+                mmap[pw.offset..pw.offset + pw.data.len()].copy_from_slice(&pw.data);
+            }
         }
 
         mmap.flush()?;
         Ok(())
+    }
+}
+
+/// Applies pending writes that overlap `[read_offset..read_offset+read_len)` to `buf`.
+///
+/// Writes are applied in order — later writes overwrite earlier ones.
+fn apply_pending(buf: &mut [u8], read_offset: usize, read_len: usize, pending: &[PendingWrite]) {
+    let read_end = read_offset + read_len;
+    for pw in pending {
+        let pw_end = pw.offset + pw.data.len();
+        // Check for overlap.
+        if pw.offset < read_end && pw_end > read_offset {
+            let start = pw.offset.max(read_offset);
+            let end = pw_end.min(read_end);
+            let buf_start = start - read_offset;
+            let pw_start = start - pw.offset;
+            buf[buf_start..buf_start + (end - start)]
+                .copy_from_slice(&pw.data[pw_start..pw_start + (end - start)]);
+        }
     }
 }
 
@@ -782,7 +817,7 @@ mod tests {
         let pf = CowFile::from_vec(vec![1, 2, 3, 4, 5]);
         assert_eq!(pf.len(), 5);
         assert!(!pf.is_empty());
-        assert_eq!(pf.base_data(), &[1, 2, 3, 4, 5]);
+        assert_eq!(pf.data(), &[1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -793,20 +828,20 @@ mod tests {
     }
 
     #[test]
-    fn test_from_path_basic() {
+    fn test_open_basic() {
         use std::io::Write;
         let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
         tmpfile.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
         tmpfile.flush().unwrap();
 
-        let pf = CowFile::from_path(tmpfile.path()).unwrap();
+        let pf = CowFile::open(tmpfile.path()).unwrap();
         assert_eq!(pf.len(), 4);
-        assert_eq!(pf.base_data(), &[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(pf.data(), &[0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
-    fn test_from_path_nonexistent() {
-        let result = CowFile::from_path("/nonexistent/path.bin");
+    fn test_open_nonexistent() {
+        let result = CowFile::open("/nonexistent/path.bin");
         assert!(result.is_err());
     }
 
@@ -815,6 +850,10 @@ mod tests {
         let pf = CowFile::from_vec(vec![0u8; 10]);
         pf.write(2, &[0xFF, 0xFE]).unwrap();
 
+        // data() shows committed state.
+        assert_eq!(pf.data()[2], 0x00);
+
+        // read() composites pending.
         let data = pf.read(0, 10).unwrap();
         assert_eq!(data[2], 0xFF);
         assert_eq!(data[3], 0xFE);
@@ -833,36 +872,34 @@ mod tests {
     fn test_write_empty_is_noop() {
         let pf = CowFile::from_vec(vec![0u8; 10]);
         pf.write(5, &[]).unwrap();
-        assert!(!pf.has_pending().unwrap());
+        assert!(!pf.has_pending());
     }
 
     #[test]
     fn test_commit_and_read() {
-        let pf = CowFile::from_vec(vec![0u8; 10]);
+        let mut pf = CowFile::from_vec(vec![0u8; 10]);
         pf.write(0, &[0xAA]).unwrap();
-        assert!(pf.has_pending().unwrap());
+        assert!(pf.has_pending());
 
         pf.commit().unwrap();
-        assert!(!pf.has_pending().unwrap());
-        assert!(pf.has_modifications().unwrap());
-
-        assert_eq!(pf.read_byte(0).unwrap(), 0xAA);
+        assert!(!pf.has_pending());
+        assert_eq!(pf.data()[0], 0xAA);
     }
 
     #[test]
     fn test_multi_commit_cycle() {
-        let pf = CowFile::from_vec(vec![0u8; 20]);
+        let mut pf = CowFile::from_vec(vec![0u8; 20]);
 
-        // Pass 1
+        // Pass 1.
         pf.write(0, &[0xAA]).unwrap();
         pf.write(10, &[0xBB]).unwrap();
         pf.commit().unwrap();
 
-        // Pass 2
+        // Pass 2.
         pf.write(5, &[0xCC]).unwrap();
         pf.commit().unwrap();
 
-        let output = pf.to_vec().unwrap();
+        let output = pf.to_vec();
         assert_eq!(output[0], 0xAA);
         assert_eq!(output[5], 0xCC);
         assert_eq!(output[10], 0xBB);
@@ -872,7 +909,7 @@ mod tests {
     fn test_to_vec_no_modifications() {
         let original = vec![1, 2, 3, 4, 5];
         let pf = CowFile::from_vec(original.clone());
-        let output = pf.to_vec().unwrap();
+        let output = pf.to_vec();
         assert_eq!(output, original);
     }
 
@@ -882,7 +919,7 @@ mod tests {
         pf.write(0, &[0xFF]).unwrap();
         pf.write(9, &[0xEE]).unwrap();
 
-        let output = pf.to_vec().unwrap();
+        let output = pf.to_vec();
         assert_eq!(output[0], 0xFF);
         assert_eq!(output[9], 0xEE);
         assert_eq!(output[5], 0x00);
@@ -923,128 +960,67 @@ mod tests {
     #[test]
     fn test_out_of_bounds_at_exact_end() {
         let pf = CowFile::from_vec(vec![0u8; 10]);
-        // Reading 0 bytes at offset 10 is within bounds (empty read).
         let result = pf.read(10, 0);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
 
     #[test]
-    fn test_has_pending_and_modifications() {
-        let pf = CowFile::from_vec(vec![0u8; 10]);
-        assert!(!pf.has_pending().unwrap());
-        assert!(!pf.has_modifications().unwrap());
+    fn test_has_pending() {
+        let mut pf = CowFile::from_vec(vec![0u8; 10]);
+        assert!(!pf.has_pending());
 
         pf.write(0, &[0xFF]).unwrap();
-        assert!(pf.has_pending().unwrap());
-        assert!(pf.has_modifications().unwrap());
+        assert!(pf.has_pending());
 
         pf.commit().unwrap();
-        assert!(!pf.has_pending().unwrap());
-        assert!(pf.has_modifications().unwrap());
+        assert!(!pf.has_pending());
     }
 
     #[test]
-    fn test_base_data_unchanged_after_writes() {
-        let pf = CowFile::from_vec(vec![1, 2, 3, 4, 5]);
+    fn test_data_shows_committed_state() {
+        let mut pf = CowFile::from_vec(vec![1, 2, 3, 4, 5]);
         pf.write(0, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+
+        // data() should still show original.
+        assert_eq!(pf.data(), &[1, 2, 3, 4, 5]);
+
         pf.commit().unwrap();
 
-        assert_eq!(pf.base_data(), &[1, 2, 3, 4, 5]);
+        // After commit, data() shows the changes.
+        assert_eq!(pf.data(), &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
     #[test]
-    fn test_concurrent_reads() {
-        use std::sync::Arc;
-        use std::thread;
+    fn test_data_while_writing() {
+        let pf = CowFile::from_vec(vec![0u8; 100]);
 
-        let pf = Arc::new(CowFile::from_vec(vec![0xAA; 1000]));
-        pf.write(500, &[0xFF; 100]).unwrap();
+        // Hold a reference to data() while writing.
+        let view = pf.data();
+        pf.write(10, &[0xFF]).unwrap();
 
-        let mut handles = vec![];
-        for _ in 0..8 {
-            let pf = Arc::clone(&pf);
-            handles.push(thread::spawn(move || {
-                for _ in 0..100 {
-                    let data = pf.read(0, 1000).unwrap();
-                    assert_eq!(data[0], 0xAA);
-                    assert_eq!(data[500], 0xFF);
-                    assert_eq!(data[999], 0xAA);
-                }
-            }));
-        }
+        // View still shows committed state.
+        assert_eq!(view[10], 0x00);
 
-        for handle in handles {
-            handle.join().unwrap();
-        }
+        // But read_byte composites pending.
+        assert_eq!(pf.read_byte(10).unwrap(), 0xFF);
     }
 
     #[test]
-    fn test_write_then_concurrent_reads() {
-        use std::sync::Arc;
-        use std::thread;
+    fn test_discard() {
+        let mut pf = CowFile::from_vec(vec![0u8; 10]);
+        pf.write(0, &[0xFF]).unwrap();
+        assert!(pf.has_pending());
 
-        let pf = Arc::new(CowFile::from_vec(vec![0u8; 100]));
-
-        // Write from the main thread.
-        for i in 0..100u8 {
-            pf.write_byte(i as u64, i).unwrap();
-        }
-        pf.commit().unwrap();
-
-        // Concurrent reads should all see the committed data.
-        let mut handles = vec![];
-        for _ in 0..4 {
-            let pf = Arc::clone(&pf);
-            handles.push(thread::spawn(move || {
-                let data = pf.to_vec().unwrap();
-                for (i, &byte) in data.iter().enumerate() {
-                    assert_eq!(byte, i as u8);
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
+        pf.discard();
+        assert!(!pf.has_pending());
+        assert_eq!(pf.read_byte(0).unwrap(), 0x00);
     }
 
     #[test]
-    fn test_concurrent_writes() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let pf = Arc::new(CowFile::from_vec(vec![0u8; 1000]));
-
-        let mut handles = vec![];
-        for t in 0..4u8 {
-            let pf = Arc::clone(&pf);
-            handles.push(thread::spawn(move || {
-                let base = t as u64 * 250;
-                for i in 0..250u64 {
-                    pf.write_byte(base + i, t).unwrap();
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Each quarter should be written by one thread.
-        let data = pf.to_vec().unwrap();
-        for t in 0..4u8 {
-            let base = t as usize * 250;
-            for i in 0..250 {
-                assert_eq!(data[base + i], t);
-            }
-        }
-    }
-
-    #[test]
-    fn test_send_sync_static_assertion() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<CowFile>();
+    fn test_send_static_assertion() {
+        fn assert_send<T: Send>() {}
+        assert_send::<CowFile>();
     }
 
     #[test]
@@ -1052,7 +1028,6 @@ mod tests {
         let pf = CowFile::from_vec(vec![0u8; 16]);
         pf.write_le::<u16>(0, 0xCAFE).unwrap();
         assert_eq!(pf.read_le::<u16>(0).unwrap(), 0xCAFE);
-        // Verify byte order.
         assert_eq!(pf.read(0, 2).unwrap(), vec![0xFE, 0xCA]);
     }
 
@@ -1075,7 +1050,6 @@ mod tests {
         let pf = CowFile::from_vec(vec![0u8; 16]);
         pf.write_be::<u32>(0, 0xDEADBEEF).unwrap();
         assert_eq!(pf.read_be::<u32>(0).unwrap(), 0xDEADBEEF);
-        // BE: most significant byte first.
         assert_eq!(pf.read(0, 4).unwrap(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
@@ -1102,7 +1076,7 @@ mod tests {
         }
 
         impl ReadFrom for TestStruct {
-            fn read_from(pf: &CowFile, offset: u64) -> crate::Result<Self> {
+            fn read_from(pf: &CowFile, offset: usize) -> crate::Result<Self> {
                 Ok(TestStruct {
                     magic: pf.read_le::<u32>(offset)?,
                     version: pf.read_le::<u16>(offset + 4)?,
@@ -1112,7 +1086,7 @@ mod tests {
         }
 
         impl WriteTo for TestStruct {
-            fn write_to(&self, pf: &CowFile, offset: u64) -> crate::Result<()> {
+            fn write_to(&self, pf: &CowFile, offset: usize) -> crate::Result<()> {
                 pf.write_le::<u32>(offset, self.magic)?;
                 pf.write_le::<u16>(offset + 4, self.version)?;
                 pf.write_le::<u8>(offset + 6, self.flags)?;
@@ -1135,68 +1109,22 @@ mod tests {
     }
 
     #[test]
-    fn test_from_std_file() {
+    fn test_from_file() {
         use std::io::Write;
         let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
         tmpfile.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
         tmpfile.flush().unwrap();
 
         let std_file = std::fs::File::open(tmpfile.path()).unwrap();
-        let pf = CowFile::from_std_file(std_file).unwrap();
+        let pf = CowFile::from_file(std_file).unwrap();
         assert_eq!(pf.len(), 4);
-        assert_eq!(pf.base_data(), &[0xDE, 0xAD, 0xBE, 0xEF]);
-    }
-
-    #[test]
-    fn test_consolidate_no_modifications() {
-        let mut pf = CowFile::from_vec(vec![1, 2, 3]);
-        pf.consolidate().unwrap();
-        assert_eq!(pf.base_data(), &[1, 2, 3]);
-        assert!(!pf.has_modifications().unwrap());
-    }
-
-    #[test]
-    fn test_consolidate_with_pending() {
-        let mut pf = CowFile::from_vec(vec![0u8; 10]);
-        pf.write(0, &[0xFF, 0xFE]).unwrap();
-        pf.consolidate().unwrap();
-
-        assert_eq!(pf.base_data()[0], 0xFF);
-        assert_eq!(pf.base_data()[1], 0xFE);
-        assert_eq!(pf.base_data()[2], 0x00);
-        assert!(!pf.has_modifications().unwrap());
-    }
-
-    #[test]
-    fn test_consolidate_with_committed_and_pending() {
-        let mut pf = CowFile::from_vec(vec![0u8; 10]);
-        pf.write(0, &[0xAA]).unwrap();
-        pf.commit().unwrap();
-        pf.write(5, &[0xBB]).unwrap();
-        pf.consolidate().unwrap();
-
-        assert_eq!(pf.base_data()[0], 0xAA);
-        assert_eq!(pf.base_data()[5], 0xBB);
-        assert!(!pf.has_modifications().unwrap());
-        assert!(!pf.has_pending().unwrap());
-    }
-
-    #[test]
-    fn test_consolidate_then_write() {
-        let mut pf = CowFile::from_vec(vec![0u8; 10]);
-        pf.write(0, &[0xFF]).unwrap();
-        pf.consolidate().unwrap();
-
-        // New writes after consolidation should work
-        pf.write(5, &[0xBB]).unwrap();
-        assert_eq!(pf.read_byte(0).unwrap(), 0xFF); // from consolidated base
-        assert_eq!(pf.read_byte(5).unwrap(), 0xBB); // from new pending
+        assert_eq!(pf.data(), &[0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
     #[test]
     fn test_into_vec_no_modifications() {
         let pf = CowFile::from_vec(vec![1, 2, 3, 4, 5]);
-        let data = pf.into_vec().unwrap();
+        let data = pf.into_vec();
         assert_eq!(data, vec![1, 2, 3, 4, 5]);
     }
 
@@ -1205,7 +1133,7 @@ mod tests {
         let pf = CowFile::from_vec(vec![0u8; 10]);
         pf.write(0, &[0xFF]).unwrap();
         pf.write(9, &[0xEE]).unwrap();
-        let data = pf.into_vec().unwrap();
+        let data = pf.into_vec();
         assert_eq!(data[0], 0xFF);
         assert_eq!(data[9], 0xEE);
         assert_eq!(data[5], 0x00);
@@ -1218,8 +1146,8 @@ mod tests {
         tmpfile.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
         tmpfile.flush().unwrap();
 
-        let pf = CowFile::from_path(tmpfile.path()).unwrap();
-        let data = pf.into_vec().unwrap();
+        let pf = CowFile::open(tmpfile.path()).unwrap();
+        let data = pf.into_vec();
         assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
@@ -1230,9 +1158,9 @@ mod tests {
         tmpfile.write_all(&[0x00, 0x00, 0x00, 0x00]).unwrap();
         tmpfile.flush().unwrap();
 
-        let pf = CowFile::from_path(tmpfile.path()).unwrap();
+        let pf = CowFile::open(tmpfile.path()).unwrap();
         pf.write(0, &[0xFF]).unwrap();
-        let data = pf.into_vec().unwrap();
+        let data = pf.into_vec();
         assert_eq!(data, vec![0xFF, 0x00, 0x00, 0x00]);
     }
 
@@ -1249,5 +1177,26 @@ mod tests {
         let mut buf = [0u8; 3];
         cursor.read_exact(&mut buf).unwrap();
         assert_eq!(buf, [0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn test_overlapping_pending_writes() {
+        let pf = CowFile::from_vec(vec![0u8; 20]);
+
+        pf.write(0, &[0xAA; 10]).unwrap();
+        pf.write(5, &[0xBB; 10]).unwrap();
+
+        let data = pf.read(0, 20).unwrap();
+        assert!(data[..5].iter().all(|&b| b == 0xAA));
+        assert!(data[5..15].iter().all(|&b| b == 0xBB));
+        assert!(data[15..20].iter().all(|&b| b == 0x00));
+    }
+
+    #[test]
+    fn test_read_byte_pending_last_wins() {
+        let pf = CowFile::from_vec(vec![0u8; 10]);
+        pf.write_byte(5, 0xAA).unwrap();
+        pf.write_byte(5, 0xBB).unwrap();
+        assert_eq!(pf.read_byte(5).unwrap(), 0xBB);
     }
 }

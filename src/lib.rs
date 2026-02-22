@@ -1,85 +1,92 @@
 //! # cowfile
 //!
-//! A copy-on-write overlay layer for immutable binary data.
+//! A copy-on-write abstraction for working with binary data from files or memory.
 //!
-//! `cowfile` provides [`CowFile`], a type that wraps immutable binary data with a sparse
-//! copy-on-write overlay. Modifications are tracked as byte-range patches without ever
-//! mutating the original data. A final merged output is produced only when explicitly
-//! requested via [`CowFile::to_vec`] or [`CowFile::to_file`].
+//! `cowfile` provides [`CowFile`], a type that wraps binary data with a pending
+//! write log. The committed buffer is backed by either a `Vec<u8>` or an OS-level
+//! copy-on-write memory map ([`MmapMut`](memmap2::MmapMut) with `MAP_PRIVATE`).
+//! Modifications accumulate in a pending log and are applied to the buffer on
+//! [`commit`](CowFile::commit).
 //!
 //! ## Use Case
 //!
-//! This crate is designed for binary analysis and transformation pipelines where multiple
-//! passes modify a binary (e.g., deobfuscation, patching) without needing to copy the
-//! entire file between each pass. Only modified byte ranges are stored in the overlay,
-//! keeping memory usage proportional to the number of changes rather than the file size.
+//! This crate is designed for binary analysis and transformation pipelines where
+//! multiple passes modify a binary (e.g., deobfuscation, patching). A parser can
+//! hold a `&[u8]` reference to the committed state via [`data`](CowFile::data)
+//! while writes accumulate in the pending log, and [`commit`](CowFile::commit)
+//! applies them cheaply (only OS pages touched by patches are copied).
 //!
 //! ## Architecture
 //!
 //! ```text
-//!  Base Layer (immutable)        Overlay (copy-on-write)
+//!  Committed Buffer               Pending Log
 //! +---------------------+      +-------------------------+
-//! | Vec<u8> or Mmap     |      | committed: BTreeMap     |
-//! | (never modified)    | <--- | pending:   BTreeMap     |
+//! | Vec<u8> or MmapMut  | <--- | Vec<PendingWrite>       |
+//! | (OS-level CoW)      |      | (applied on commit)     |
 //! +---------------------+      +-------------------------+
 //! ```
 //!
-//! - **Base layer**: Immutable data from a `Vec<u8>` or a memory-mapped file.
-//! - **Pending overlay**: Uncommitted modifications from the current pass.
-//! - **Committed overlay**: Consolidated modifications from previous [`commit`](CowFile::commit) calls.
+//! - **Committed buffer**: `Vec<u8>` (owned) or `MmapMut` created with
+//!   [`map_copy`](memmap2::MmapOptions::map_copy) (`MAP_PRIVATE` on Unix,
+//!   `PAGE_WRITECOPY` on Windows). Only pages touched by commits use extra RAM.
+//! - **Pending log**: Accumulated writes not yet applied to the buffer.
 //!
-//! When reading, layers are composited with priority: **pending > committed > base**.
+//! [`data`](CowFile::data) returns `&[u8]` of the committed buffer.
+//! [`read`](CowFile::read), [`read_le`](CowFile::read_le), etc. composite
+//! pending writes over the committed state.
 //!
 //! ## Thread Safety
 //!
-//! [`CowFile`] is [`Send`] + [`Sync`]. The immutable base layer requires no synchronization.
-//! The overlay is protected by an internal [`RwLock`](std::sync::RwLock) that allows
-//! concurrent reads with exclusive writes.
+//! [`CowFile`] is [`Send`] but not [`Sync`]. For shared concurrent access,
+//! wrap in `Arc<Mutex<CowFile>>`.
 //!
 //! ## Quick Start
 //!
 //! ```
 //! use cowfile::CowFile;
 //!
-//! // Create from owned bytes
 //! let pf = CowFile::from_vec(vec![0u8; 1024]);
 //!
-//! // Pass 1: Apply modifications
+//! // Writes go to the pending log
 //! pf.write(0x10, &[0xFF, 0xFE]).unwrap();
 //! pf.write(0x20, &[0xAA, 0xBB, 0xCC]).unwrap();
+//!
+//! // data() shows committed state (before writes)
+//! assert_eq!(pf.data()[0x10], 0x00);
+//!
+//! // read() composites pending writes
+//! assert_eq!(pf.read_byte(0x10).unwrap(), 0xFF);
+//!
+//! // Commit applies pending to the buffer
+//! let mut pf = pf;
 //! pf.commit().unwrap();
 //!
-//! // Pass 2: More modifications
-//! pf.write(0x30, &[0xDD]).unwrap();
-//! pf.commit().unwrap();
-//!
-//! // Produce final output
-//! let output = pf.to_vec().unwrap();
-//! assert_eq!(output[0x10], 0xFF);
-//! assert_eq!(output[0x20], 0xAA);
-//! assert_eq!(output[0x30], 0xDD);
+//! // Now data() shows the committed writes
+//! assert_eq!(pf.data()[0x10], 0xFF);
 //! ```
 //!
 //! ## Memory-Mapped Files
 //!
-//! For large binaries, use [`CowFile::from_path`] to memory-map the file. The operating
-//! system handles paging, so only accessed regions are loaded into physical memory:
+//! For large binaries, use [`CowFile::open`] to create a copy-on-write memory
+//! map. The OS handles paging — only accessed regions are loaded into physical
+//! memory, and only pages modified by [`commit`](CowFile::commit) are copied:
 //!
 //! ```no_run
 //! use cowfile::CowFile;
 //!
-//! let pf = CowFile::from_path("large_binary.exe").unwrap();
-//! pf.write(0, &[0x4D, 0x5A]).unwrap(); // Patch MZ header
+//! let pf = CowFile::open("large_binary.exe").unwrap();
+//! pf.write(0, &[0x4D, 0x5A]).unwrap(); // Pending
+//!
+//! let mut pf = pf;
+//! pf.commit().unwrap();                 // Only the first page is CoW'd
 //! pf.to_file("patched.exe").unwrap();   // Write output
 //! ```
 
 #![deny(missing_docs)]
 
-mod backend;
 mod cowfile;
 mod cursor;
 mod error;
-mod overlay;
 mod primitives;
 mod traits;
 
