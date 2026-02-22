@@ -260,7 +260,7 @@ mod tests {
         let copied = std::io::copy(&mut src_cursor, &mut dst_cursor).unwrap();
         assert_eq!(copied, 8);
 
-        let output = dst.to_vec();
+        let output = dst.to_vec().unwrap();
         assert_eq!(output, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 

@@ -35,7 +35,7 @@ fn test_end_to_end_vec() {
     assert_eq!(pf.read(100, 10).unwrap(), data[100..110]);
 
     // Produce output (composites pending).
-    let output = pf.to_vec();
+    let output = pf.to_vec().unwrap();
     assert_eq!(output.len(), 1024);
     assert_eq!(&output[0..4], &[0x4D, 0x5A, 0x90, 0x00]);
     assert_eq!(&output[512..516], &[0xDE, 0xAD, 0xBE, 0xEF]);
@@ -68,7 +68,7 @@ fn test_end_to_end_mmap() {
     pf.write(255, &[0x00]).unwrap();
     pf.commit().unwrap();
 
-    let output = pf.to_vec();
+    let output = pf.to_vec().unwrap();
     assert_eq!(output[0], 0xFF);
     assert_eq!(output[1], 1); // Original
     assert_eq!(output[255], 0x00);
@@ -147,7 +147,7 @@ fn test_discard_pending() {
     pf.write(0, &[0xFF; 50]).unwrap();
     assert!(pf.has_pending());
 
-    pf.discard();
+    pf.discard().unwrap();
     assert!(!pf.has_pending());
 
     // All data should still be zeros.
@@ -193,7 +193,7 @@ fn test_deobfuscation_simulation() {
     pf.commit().unwrap();
 
     // Verify all bytes are "decrypted" (should be sequential indices).
-    let output = pf.to_vec();
+    let output = pf.to_vec().unwrap();
     for (i, &byte) in output.iter().enumerate() {
         assert_eq!(byte, (i % 256) as u8, "mismatch at offset {i}");
     }
@@ -210,7 +210,7 @@ fn test_to_file_matches_to_vec() {
     pf.write(200, &[0xFF]).unwrap();
 
     // Get both outputs.
-    let vec_output = pf.to_vec();
+    let vec_output = pf.to_vec().unwrap();
 
     let tmpfile = tempfile::NamedTempFile::new().unwrap();
     pf.to_file(tmpfile.path()).unwrap();
@@ -261,7 +261,7 @@ fn test_overlapping_write_regions() {
     pf.commit().unwrap();
 
     // After commit, result should be the same.
-    let committed = pf.to_vec();
+    let committed = pf.to_vec().unwrap();
     assert_eq!(&committed[..], &data[..]);
 }
 
@@ -281,7 +281,7 @@ fn test_overwrite_committed_with_pending() {
 
     // Commit again and verify.
     pf.commit().unwrap();
-    let output = pf.to_vec();
+    let output = pf.to_vec().unwrap();
     assert_eq!(&output[0..5], &[0xAA, 0xAA, 0xBB, 0xBB, 0xBB]);
     assert_eq!(&output[5..10], &[0x00; 5]);
 }
@@ -455,7 +455,7 @@ fn test_cursor_multiple_independent() {
     c1.write_all(&[0xAA; 8]).unwrap();
     c2.write_all(&[0xBB; 8]).unwrap();
 
-    let output = pf.to_vec();
+    let output = pf.to_vec().unwrap();
     assert!(output[..8].iter().all(|&b| b == 0xAA));
     assert!(output[8..16].iter().all(|&b| b == 0x00));
     assert!(output[16..24].iter().all(|&b| b == 0xBB));
@@ -515,7 +515,7 @@ fn test_commit_merges_overlapping_committed_entries() {
     pf.commit().unwrap();
 
     // Verify final output.
-    let output = pf.to_vec();
+    let output = pf.to_vec().unwrap();
     assert!(output[..3].iter().all(|&b| b == 0xAA));
     assert!(output[3..12].iter().all(|&b| b == 0xCC));
     assert!(output[12..15].iter().all(|&b| b == 0xBB));
@@ -533,7 +533,7 @@ fn test_pending_fully_covering_committed() {
     // Pending write that entirely covers it.
     pf.write(0, &[0xBB; 20]).unwrap();
 
-    let output = pf.to_vec();
+    let output = pf.to_vec().unwrap();
     assert!(output.iter().all(|&b| b == 0xBB));
 }
 
@@ -575,7 +575,7 @@ fn test_dirty_flag_optimization() {
     // After discard, dirty flag is false.
     pf.write(0, &[0xEE]).unwrap();
     assert!(pf.has_pending());
-    pf.discard();
+    pf.discard().unwrap();
     assert!(!pf.has_pending());
 }
 
@@ -583,14 +583,14 @@ fn test_dirty_flag_optimization() {
 fn test_into_vec() {
     // Unmodified Vec — zero-copy move.
     let pf = CowFile::from_vec(vec![1, 2, 3]);
-    let data = pf.into_vec();
+    let data = pf.into_vec().unwrap();
     assert_eq!(data, vec![1, 2, 3]);
 
     // Modified Vec — materializes with pending applied.
     let pf = CowFile::from_vec(vec![0u8; 10]);
     pf.write(0, &[0xFF]).unwrap();
     pf.write(9, &[0xEE]).unwrap();
-    let data = pf.into_vec();
+    let data = pf.into_vec().unwrap();
     assert_eq!(data[0], 0xFF);
     assert_eq!(data[9], 0xEE);
     assert_eq!(data[5], 0x00);
@@ -601,7 +601,7 @@ fn test_into_vec() {
     tmpfile.flush().unwrap();
 
     let pf = CowFile::open(tmpfile.path()).unwrap();
-    let data = pf.into_vec();
+    let data = pf.into_vec().unwrap();
     assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
 }
 

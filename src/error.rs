@@ -23,6 +23,10 @@ pub enum Error {
         /// The total size of the file.
         file_size: usize,
     },
+
+    /// An internal lock was poisoned by a panicking thread.
+    #[error("lock poisoned: {0}")]
+    LockPoisoned(String),
 }
 
 impl From<Error> for std::io::Error {

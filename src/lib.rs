@@ -37,8 +37,9 @@
 //!
 //! ## Thread Safety
 //!
-//! [`CowFile`] is [`Send`] but not [`Sync`]. For shared concurrent access,
-//! wrap in `Arc<Mutex<CowFile>>`.
+//! [`CowFile`] is [`Send`] and [`Sync`]. The committed buffer can be read
+//! concurrently via [`data`](CowFile::data) from multiple threads. Writes
+//! to the pending log are serialised by an internal [`RwLock`](std::sync::RwLock).
 //!
 //! ## Quick Start
 //!

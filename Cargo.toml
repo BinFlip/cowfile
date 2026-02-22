@@ -1,6 +1,6 @@
 [package]
 name = "cowfile"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Johann Kempter <admin@binflip.rs>"]
 edition = "2021"
 description = "A copy-on-write abstraction for binary data backed by memory or files"

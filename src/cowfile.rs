@@ -7,14 +7,18 @@
 //!
 //! # Thread Safety
 //!
-//! `CowFile` is [`Send`] but not [`Sync`]. For shared concurrent access,
-//! wrap in `Arc<Mutex<CowFile>>`.
+//! `CowFile` is [`Send`] and [`Sync`]. The committed buffer can be read
+//! concurrently via [`data`](CowFile::data) from multiple threads. Writes
+//! to the pending log are serialised by an internal [`RwLock`](std::sync::RwLock).
 
 use std::{
-    cell::{Cell, RefCell},
     fmt,
     io::Write,
     path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        RwLock,
+    },
 };
 
 use crate::{
@@ -113,16 +117,16 @@ pub struct CowFile {
     /// Committed buffer — only mutated by `commit()`.
     buffer: Inner,
     /// Pending writes, accumulated via interior mutability.
-    pending: RefCell<Vec<PendingWrite>>,
+    pending: RwLock<Vec<PendingWrite>>,
     /// Fast check to skip empty pending iteration.
-    dirty: Cell<bool>,
+    dirty: AtomicBool,
 }
 
-// Static assertion: CowFile must be Send.
+// Static assertion: CowFile must be Send + Sync.
 const _: () = {
-    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
     fn check() {
-        assert_send::<CowFile>();
+        assert_send_sync::<CowFile>();
     }
     let _ = check;
 };
@@ -138,7 +142,7 @@ impl fmt::Debug for CowFile {
                     Inner::Mmap(_) => "Mmap",
                 },
             )
-            .field("dirty", &self.dirty.get())
+            .field("dirty", &self.dirty.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -160,8 +164,8 @@ impl CowFile {
     pub fn from_vec(data: Vec<u8>) -> Self {
         CowFile {
             buffer: Inner::Vec(data),
-            pending: RefCell::new(Vec::new()),
-            dirty: Cell::new(false),
+            pending: RwLock::new(Vec::new()),
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -223,8 +227,8 @@ impl CowFile {
         let mmap = unsafe { memmap2::MmapOptions::new().map_copy(&file)? };
         Ok(CowFile {
             buffer: Inner::Mmap(mmap),
-            pending: RefCell::new(Vec::new()),
-            dirty: Cell::new(false),
+            pending: RwLock::new(Vec::new()),
+            dirty: AtomicBool::new(false),
         })
     }
 
@@ -276,7 +280,7 @@ impl CowFile {
     /// assert!(pf.has_pending());
     /// ```
     pub fn has_pending(&self) -> bool {
-        self.dirty.get()
+        self.dirty.load(Ordering::Relaxed)
     }
 
     /// Reads `length` bytes starting at `offset`, compositing pending writes.
@@ -309,8 +313,11 @@ impl CowFile {
 
         let mut buf = self.buffer.as_slice()[offset..offset + length].to_vec();
 
-        if self.dirty.get() {
-            let pending = self.pending.borrow();
+        if self.dirty.load(Ordering::Relaxed) {
+            let pending = self
+                .pending
+                .read()
+                .map_err(|e| Error::LockPoisoned(e.to_string()))?;
             apply_pending(&mut buf, offset, length, &pending);
         }
 
@@ -337,8 +344,11 @@ impl CowFile {
     pub fn read_byte(&self, offset: usize) -> Result<u8> {
         self.check_bounds(offset, 1)?;
 
-        if self.dirty.get() {
-            let pending = self.pending.borrow();
+        if self.dirty.load(Ordering::Relaxed) {
+            let pending = self
+                .pending
+                .read()
+                .map_err(|e| Error::LockPoisoned(e.to_string()))?;
             // Scan in reverse — last write wins.
             for pw in pending.iter().rev() {
                 let pw_end = pw.offset + pw.data.len();
@@ -381,11 +391,14 @@ impl CowFile {
 
         self.check_bounds(offset, data.len())?;
 
-        self.pending.borrow_mut().push(PendingWrite {
-            offset,
-            data: data.to_vec(),
-        });
-        self.dirty.set(true);
+        self.pending
+            .write()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .push(PendingWrite {
+                offset,
+                data: data.to_vec(),
+            });
+        self.dirty.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -424,22 +437,29 @@ impl CowFile {
     /// assert!(!pf.has_pending());
     /// ```
     pub fn commit(&mut self) -> Result<()> {
-        if !self.dirty.get() {
+        if !*self.dirty.get_mut() {
             return Ok(());
         }
 
-        let pending = self.pending.get_mut();
+        let pending = self
+            .pending
+            .get_mut()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
         let buf = self.buffer.as_mut_slice();
 
         for pw in pending.drain(..) {
             buf[pw.offset..pw.offset + pw.data.len()].copy_from_slice(&pw.data);
         }
 
-        self.dirty.set(false);
+        *self.dirty.get_mut() = false;
         Ok(())
     }
 
     /// Discards all pending writes without applying them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::LockPoisoned`] if the internal lock was poisoned.
     ///
     /// # Examples
     ///
@@ -450,13 +470,17 @@ impl CowFile {
     /// pf.write(0, &[0xFF]).unwrap();
     /// assert!(pf.has_pending());
     ///
-    /// pf.discard();
+    /// pf.discard().unwrap();
     /// assert!(!pf.has_pending());
     /// assert_eq!(pf.data()[0], 0x00);
     /// ```
-    pub fn discard(&mut self) {
-        self.pending.get_mut().clear();
-        self.dirty.set(false);
+    pub fn discard(&mut self) -> Result<()> {
+        self.pending
+            .get_mut()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .clear();
+        *self.dirty.get_mut() = false;
+        Ok(())
     }
 
     /// Reads a primitive value in little-endian byte order at the given offset.
@@ -643,6 +667,10 @@ impl CowFile {
     /// Produces a `Vec<u8>` with all pending writes composited over the
     /// committed buffer.
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::LockPoisoned`] if the internal lock was poisoned.
+    ///
     /// # Examples
     ///
     /// ```
@@ -651,20 +679,23 @@ impl CowFile {
     /// let pf = CowFile::from_vec(vec![1, 2, 3, 4, 5]);
     /// pf.write(0, &[0xFF]).unwrap();
     ///
-    /// let output = pf.to_vec();
+    /// let output = pf.to_vec().unwrap();
     /// assert_eq!(output, vec![0xFF, 2, 3, 4, 5]);
     /// ```
-    pub fn to_vec(&self) -> Vec<u8> {
+    pub fn to_vec(&self) -> Result<Vec<u8>> {
         let mut output = self.buffer.as_slice().to_vec();
 
-        if self.dirty.get() {
-            let pending = self.pending.borrow();
+        if self.dirty.load(Ordering::Relaxed) {
+            let pending = self
+                .pending
+                .read()
+                .map_err(|e| Error::LockPoisoned(e.to_string()))?;
             for pw in pending.iter() {
                 output[pw.offset..pw.offset + pw.data.len()].copy_from_slice(&pw.data);
             }
         }
 
-        output
+        Ok(output)
     }
 
     /// Writes the data with all pending writes applied to disk.
@@ -691,7 +722,7 @@ impl CowFile {
         if size >= MMAP_WRITE_THRESHOLD {
             self.to_file_mmap(path.as_ref())
         } else {
-            let output = self.to_vec();
+            let output = self.to_vec()?;
             let mut file = std::fs::File::create(path.as_ref())?;
             file.write_all(&output)?;
             file.flush()?;
@@ -705,26 +736,33 @@ impl CowFile {
     /// zero-copy move. Otherwise, the data is materialized with pending writes
     /// applied.
     ///
+    /// # Errors
+    ///
+    /// Returns [`Error::LockPoisoned`] if the internal lock was poisoned.
+    ///
     /// # Examples
     ///
     /// ```
     /// use cowfile::CowFile;
     ///
     /// let pf = CowFile::from_vec(vec![1, 2, 3]);
-    /// let data = pf.into_vec();
+    /// let data = pf.into_vec().unwrap();
     /// assert_eq!(data, vec![1, 2, 3]);
     /// ```
-    pub fn into_vec(self) -> Vec<u8> {
-        let dirty = self.dirty.get();
+    pub fn into_vec(self) -> Result<Vec<u8>> {
+        let dirty = self.dirty.load(Ordering::Relaxed);
 
         if !dirty {
-            return match self.buffer {
+            return Ok(match self.buffer {
                 Inner::Vec(v) => v,
                 Inner::Mmap(m) => m.as_ref().to_vec(),
-            };
+            });
         }
 
-        let pending = self.pending.into_inner();
+        let pending = self
+            .pending
+            .into_inner()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?;
         let mut output = match self.buffer {
             Inner::Vec(v) => v,
             Inner::Mmap(m) => m.as_ref().to_vec(),
@@ -734,7 +772,7 @@ impl CowFile {
             output[pw.offset..pw.offset + pw.data.len()].copy_from_slice(&pw.data);
         }
 
-        output
+        Ok(output)
     }
 
     /// Validates that `[offset, offset + length)` is within bounds.
@@ -774,8 +812,11 @@ impl CowFile {
         let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
         mmap.copy_from_slice(base);
 
-        if self.dirty.get() {
-            let pending = self.pending.borrow();
+        if self.dirty.load(Ordering::Relaxed) {
+            let pending = self
+                .pending
+                .read()
+                .map_err(|e| Error::LockPoisoned(e.to_string()))?;
             for pw in pending.iter() {
                 mmap[pw.offset..pw.offset + pw.data.len()].copy_from_slice(&pw.data);
             }
@@ -899,7 +940,7 @@ mod tests {
         pf.write(5, &[0xCC]).unwrap();
         pf.commit().unwrap();
 
-        let output = pf.to_vec();
+        let output = pf.to_vec().unwrap();
         assert_eq!(output[0], 0xAA);
         assert_eq!(output[5], 0xCC);
         assert_eq!(output[10], 0xBB);
@@ -909,7 +950,7 @@ mod tests {
     fn test_to_vec_no_modifications() {
         let original = vec![1, 2, 3, 4, 5];
         let pf = CowFile::from_vec(original.clone());
-        let output = pf.to_vec();
+        let output = pf.to_vec().unwrap();
         assert_eq!(output, original);
     }
 
@@ -919,7 +960,7 @@ mod tests {
         pf.write(0, &[0xFF]).unwrap();
         pf.write(9, &[0xEE]).unwrap();
 
-        let output = pf.to_vec();
+        let output = pf.to_vec().unwrap();
         assert_eq!(output[0], 0xFF);
         assert_eq!(output[9], 0xEE);
         assert_eq!(output[5], 0x00);
@@ -1012,7 +1053,7 @@ mod tests {
         pf.write(0, &[0xFF]).unwrap();
         assert!(pf.has_pending());
 
-        pf.discard();
+        pf.discard().unwrap();
         assert!(!pf.has_pending());
         assert_eq!(pf.read_byte(0).unwrap(), 0x00);
     }
@@ -1124,7 +1165,7 @@ mod tests {
     #[test]
     fn test_into_vec_no_modifications() {
         let pf = CowFile::from_vec(vec![1, 2, 3, 4, 5]);
-        let data = pf.into_vec();
+        let data = pf.into_vec().unwrap();
         assert_eq!(data, vec![1, 2, 3, 4, 5]);
     }
 
@@ -1133,7 +1174,7 @@ mod tests {
         let pf = CowFile::from_vec(vec![0u8; 10]);
         pf.write(0, &[0xFF]).unwrap();
         pf.write(9, &[0xEE]).unwrap();
-        let data = pf.into_vec();
+        let data = pf.into_vec().unwrap();
         assert_eq!(data[0], 0xFF);
         assert_eq!(data[9], 0xEE);
         assert_eq!(data[5], 0x00);
@@ -1147,7 +1188,7 @@ mod tests {
         tmpfile.flush().unwrap();
 
         let pf = CowFile::open(tmpfile.path()).unwrap();
-        let data = pf.into_vec();
+        let data = pf.into_vec().unwrap();
         assert_eq!(data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
 
@@ -1160,7 +1201,7 @@ mod tests {
 
         let pf = CowFile::open(tmpfile.path()).unwrap();
         pf.write(0, &[0xFF]).unwrap();
-        let data = pf.into_vec();
+        let data = pf.into_vec().unwrap();
         assert_eq!(data, vec![0xFF, 0x00, 0x00, 0x00]);
     }
 
