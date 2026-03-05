@@ -1,6 +1,6 @@
 [package]
 name = "cowfile"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Johann Kempter <admin@binflip.rs>"]
 edition = "2021"
 description = "A copy-on-write abstraction for binary data backed by memory or files"
@@ -21,7 +21,7 @@ thiserror = "2.0.18"
 memmap2 = "0.9.10"
 
 [dev-dependencies]
-tempfile = "3.25.0"
+tempfile = "3.26.0"
 
 [profile.release]
 lto = "fat"

@@ -14,7 +14,7 @@
 use std::{
     fmt,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         RwLock,
@@ -120,6 +120,8 @@ pub struct CowFile {
     pending: RwLock<Vec<PendingWrite>>,
     /// Fast check to skip empty pending iteration.
     dirty: AtomicBool,
+    /// Original file path (set by `open()`, `None` for vec-backed).
+    source_path: Option<PathBuf>,
 }
 
 // Static assertion: CowFile must be Send + Sync.
@@ -166,6 +168,7 @@ impl CowFile {
             buffer: Inner::Vec(data),
             pending: RwLock::new(Vec::new()),
             dirty: AtomicBool::new(false),
+            source_path: None,
         }
     }
 
@@ -189,8 +192,11 @@ impl CowFile {
     /// println!("File size: {} bytes", pf.len());
     /// ```
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = std::fs::File::open(path.as_ref())?;
-        Self::from_file(file)
+        let path = path.as_ref();
+        let file = std::fs::File::open(path)?;
+        let mut cow = Self::from_file(file)?;
+        cow.source_path = Some(path.to_path_buf());
+        Ok(cow)
     }
 
     /// Creates a `CowFile` from an already-opened [`std::fs::File`].
@@ -229,6 +235,7 @@ impl CowFile {
             buffer: Inner::Mmap(mmap),
             pending: RwLock::new(Vec::new()),
             dirty: AtomicBool::new(false),
+            source_path: None,
         })
     }
 
@@ -662,6 +669,59 @@ impl CowFile {
     /// ```
     pub fn cursor(&self) -> CowFileCursor<'_> {
         CowFileCursor::new(self)
+    }
+
+    /// Returns the original file path for mmap-backed instances opened via [`open`](CowFile::open).
+    ///
+    /// Returns `None` for vec-backed instances or those created via [`from_file`](CowFile::from_file).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use cowfile::CowFile;
+    ///
+    /// let pf = CowFile::open("binary.exe").unwrap();
+    /// assert!(pf.source_path().is_some());
+    ///
+    /// let pf = CowFile::from_vec(vec![0u8; 10]);
+    /// assert!(pf.source_path().is_none());
+    /// ```
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
+    }
+
+    /// Creates an independent copy of this `CowFile`.
+    ///
+    /// For mmap-backed files with a known source path, re-opens the original
+    /// file — a new `MAP_PRIVATE` mmap that shares physical read pages with
+    /// the parent via OS-level copy-on-write. For vec-backed files or those
+    /// without a source path, clones the data.
+    ///
+    /// Pending writes are **not** carried over — the fork starts clean.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the source file cannot be reopened.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use cowfile::CowFile;
+    ///
+    /// let pf = CowFile::open("binary.exe").unwrap();
+    /// pf.write(0, &[0xFF]).unwrap();
+    ///
+    /// let forked = pf.fork().unwrap();
+    /// // Fork starts clean — no pending writes
+    /// assert!(!forked.has_pending());
+    /// // But reads the same committed data
+    /// assert_eq!(forked.data()[0], pf.data()[0]);
+    /// ```
+    pub fn fork(&self) -> Result<CowFile> {
+        match &self.source_path {
+            Some(path) => CowFile::open(path),
+            None => Ok(CowFile::from_vec(self.buffer.as_slice().to_vec())),
+        }
     }
 
     /// Produces a `Vec<u8>` with all pending writes composited over the
